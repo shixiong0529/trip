@@ -112,7 +112,8 @@ def _parse_markdown_to_blocks(md: str) -> list[dict]:
             while i < len(lines) and re.match(r"^[\s]*[-*]\s+", lines[i]) \
                     and not re.match(r"^[\s]*[-*]\s+\[[ x]\]", lines[i]):
                 m_item = re.match(r"^(\s*)[-*]\s+(.*)", lines[i])
-                indent = len(m_item.group(1))
+                # tab 缩进按 2 空格折算，同样识别为子项
+                indent = len(m_item.group(1).replace("\t", "  "))
                 item_text = m_item.group(2)
                 if indent >= 2 and list_items:
                     list_items[-1]["children"].append(item_text)
