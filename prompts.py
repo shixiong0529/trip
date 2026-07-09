@@ -216,7 +216,7 @@ SYSTEM_PROMPT = """你是一位顶级的 AI 旅行规划师，名为「路小鲜
 
 
 def build_user_message(query: str, travel_data: dict = None) -> str:
-    """构建 User Message，注入携程实时数据"""
+    """构建 User Message，注入可用的外部实时/准实时数据。"""
     travel_data = travel_data or {}
 
     transport = travel_data.get("transport", "")
@@ -224,14 +224,17 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
     attractions = travel_data.get("attractions", "")
     tips = travel_data.get("tips", "")
     train = travel_data.get("train", "")
+    amap = travel_data.get("amap", "")
 
     data_context = ""
-    if any([transport, hotels, attractions, tips, train]):
-        data_context = "\n\n--- 携程问道实时查询的真实数据，请直接引用其中的具体数字 ---\n"
+    if any([transport, hotels, attractions, tips, train, amap]):
+        data_context = "\n\n--- 外部接口查询数据，请优先引用其中的具体数字，并注明以官方/平台实时信息为准 ---\n"
         if transport:
             data_context += f"\n【真实交通数据】\n{transport}\n"
         if train:
             data_context += f"\n【真实火车票数据】\n{train}\n"
+        if amap:
+            data_context += f"\n【高德地图位置与周边数据】\n{amap}\n"
         if hotels:
             data_context += f"\n【真实酒店数据】\n{hotels}\n"
         if attractions:

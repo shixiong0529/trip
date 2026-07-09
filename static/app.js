@@ -74,18 +74,22 @@
       state.pdfReady = data.pdf_ready !== false;
       updatePdfButtonState();
 
-      if (hasKey) {
-        els.statusDot.className = 'status-dot connected';
-        els.statusText.textContent = hasServerKey
-          ? 'LLM 已配置（服务端 API Key）'
-          : 'LLM 已配置（浏览器 API Key）';
-      } else {
-        els.statusDot.className = 'status-dot disconnected';
-        els.statusText.textContent = '未配置 API Key，请在服务端 .env 中设置 LLM_API_KEY';
+      if (els.statusDot && els.statusText) {
+        if (hasKey) {
+          els.statusDot.className = 'status-dot connected';
+          els.statusText.textContent = hasServerKey
+            ? 'LLM 已配置（服务端 API Key）'
+            : 'LLM 已配置（浏览器 API Key）';
+        } else {
+          els.statusDot.className = 'status-dot disconnected';
+          els.statusText.textContent = '未配置 API Key，请在服务端 .env 中设置 LLM_API_KEY';
+        }
       }
     } catch (e) {
-      els.statusDot.className = 'status-dot error';
-      els.statusText.textContent = '服务连接失败，请确认后端已启动';
+      if (els.statusDot && els.statusText) {
+        els.statusDot.className = 'status-dot error';
+        els.statusText.textContent = '服务连接失败，请确认后端已启动';
+      }
     }
   }
 
@@ -437,9 +441,11 @@
     setMode('idle');
 
     // 点击状态条重新检测服务状态
-    els.statusBar.style.cursor = 'pointer';
-    els.statusBar.title = '点击重新检测服务状态';
-    els.statusBar.addEventListener('click', checkHealth);
+    if (els.statusBar) {
+      els.statusBar.style.cursor = 'pointer';
+      els.statusBar.title = '点击重新检测服务状态';
+      els.statusBar.addEventListener('click', checkHealth);
+    }
   }
 
   init();

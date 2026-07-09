@@ -51,6 +51,7 @@ def _clean_cache():
 async def health_check():
     import os
     from generator import _weasyprint_available
+    from services import fliggy_flight
     ctrip_ready = bool(os.getenv("WENDAO_API_KEY", "").strip())
     return {
         "status": "ok",
@@ -58,6 +59,7 @@ async def health_check():
         "model": llm_config.model,
         "ctrip_ready": ctrip_ready,
         "pdf_ready": _weasyprint_available,
+        "fliggy_ready": fliggy_flight.is_configured(),
     }
 
 
@@ -311,11 +313,27 @@ async def flights_search(
 
 # ---------- 实时服务 API ----------
 @app.get("/api/flight/track")
-async def track_flight(airport: str = Query(""), callsign: str = Query("")):
-    """实时航班追踪"""
-    from services import flight_tracker
+async def track_flight(
+    airport: str = Query(""),
+    callsign: str = Query(""),
+    date: str = Query(""),
+):
+    """实时航班追踪
+
+    按航班号查询时优先走飞猪航班动态（需配置 FLIGGY_APP_KEY/SECRET，国内可达），
+    未配置或按机场查询时回退 OpenSky。date 为可选起飞日期 YYYY-MM-DD（仅飞猪支持）。
+    """
+    from services import flight_tracker, fliggy_flight
+    if date:
+        _validate_date(date)
+
     if callsign:
-        result = await flight_tracker.track_by_callsign(callsign)
+        if fliggy_flight.is_configured():
+            result = await fliggy_flight.query_flight_dynamic(
+                flight_no=callsign, flight_date=date
+            )
+        else:
+            result = await flight_tracker.track_by_callsign(callsign)
     elif airport:
         result = await flight_tracker.track_by_airport(airport)
     else:
@@ -345,6 +363,14 @@ async def index():
     if index_path.exists():
         return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
     return HTMLResponse("<h1>AI 旅行攻略生成器</h1><p>前端页面尚未创建。</p>")
+
+
+@app.get("/info")
+async def info_page():
+    info_path = static_dir / "info.html"
+    if info_path.exists():
+        return HTMLResponse(content=info_path.read_text(encoding="utf-8"))
+    raise HTTPException(status_code=404, detail="信息页不存在")
 
 
 # ---------- 启动入口 ----------

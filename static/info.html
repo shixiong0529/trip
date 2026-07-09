@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>路小鲜 · 信息说明</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="info-page">
+
+<div class="bg-scene" aria-hidden="true"></div>
+
+<header class="app-header">
+  <div class="header-inner">
+    <a class="logo-area logo-link" href="/" aria-label="返回首页">
+      <img class="logo-icon" src="/static/logo-nav.png" alt="路小鲜">
+      <span class="app-title">路小鲜<span class="title-dot">·</span>信息说明</span>
+    </a>
+    <nav class="header-nav">
+      <a class="nav-tab active" href="/info#data-source">说明</a>
+      <a class="nav-tab" href="/">返回首页</a>
+    </nav>
+  </div>
+</header>
+
+<main class="main-content info-main">
+  <section class="info-hero panel">
+    <p class="eyebrow">NOTA BENE · 附注</p>
+    <h1>数据、隐私、条款与联系</h1>
+    <p>这里集中说明路小鲜的信息来源、使用边界、隐私处理方式和联系方式。所有说明用于帮助你理解本工具的能力与限制。</p>
+  </section>
+
+  <nav class="info-anchor-nav" aria-label="页面目录">
+    <a href="/info#data-source">数据来源</a>
+    <a href="/info#privacy">隐私政策</a>
+    <a href="/info#terms">服务条款</a>
+    <a href="/info#contact">联系我们</a>
+  </nav>
+
+  <section class="info-section panel" id="data-source">
+    <h2>数据来源</h2>
+    <p>本工具会结合 AI 模型、公开互联网资料和已配置的第三方接口生成旅行参考方案。目前项目中可用的数据源包括携程问道、高德 Web 服务、12306 余票参考，以及项目内已接入的航班/航空天气等独立查询能力。</p>
+    <p>其中，高德数据主要用于目的地定位、POI、天气、路线和静态地图；12306 数据用于火车余票参考；携程问道用于机票、酒店、景点和实用贴士等旅行信息补充。</p>
+    <p>所有价格、营业时间、路线、签证和交通信息都可能发生变化，最终请以航空公司、铁路、景区、酒店、使领馆和各平台官方实时信息为准。</p>
+  </section>
+
+  <section class="info-section panel" id="privacy">
+    <h2>隐私政策</h2>
+    <p>你在首页输入的目的地、天数、预算、偏好等内容仅用于生成旅行攻略和展示结果。项目不会要求你输入身份证号、护照号、银行卡号等敏感信息。</p>
+    <p>如果你选择保存行程，行程内容会写入本地 SQLite 数据库，用于“我的行程”展示和后续查看。你可以在页面中删除已保存的行程。</p>
+    <p>调用第三方接口时，系统可能会把与查询相关的城市、地点、日期、路线节点等必要信息发送给对应服务方，用于返回数据或生成地图。</p>
+  </section>
+
+  <section class="info-section panel" id="terms">
+    <h2>服务条款</h2>
+    <p>本工具生成的攻略仅供出行规划参考，不构成订票、订酒店、签证、保险、医疗、法律或商业建议。</p>
+    <p>你需要自行核实重要信息，包括但不限于票价、余票、航班动态、酒店库存、景区开放时间、预约规则、天气预警、道路通行、签证政策和当地法规。</p>
+    <p>因第三方接口延迟、公开信息变化、AI 推断偏差或用户输入不完整导致的误差，均应在出行前通过官方渠道再次确认。</p>
+  </section>
+
+  <section class="info-section panel" id="contact">
+    <h2>联系我们</h2>
+    <p>如需反馈问题、提出建议或联系维护者，请发送邮件至：</p>
+    <p><a class="contact-email" href="mailto:76106737@qq.com">76106737@qq.com</a></p>
+  </section>
+</main>
+
+<footer class="app-footer">
+  <div class="footer-bottom">
+    <div class="footer-brand">
+      <span class="footer-mark">路</span>
+      <span>© 2026 路小鲜 · LUXIAN TRAVEL ADVISORY</span>
+    </div>
+    <nav class="footer-links" aria-label="页脚链接">
+      <a href="/info#data-source">数据来源</a>
+      <a href="/info#privacy">隐私政策</a>
+      <a href="/info#terms">服务条款</a>
+      <a href="/info#contact">联系我们</a>
+    </nav>
+  </div>
+</footer>
+
+</body>
+</html>

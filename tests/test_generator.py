@@ -117,6 +117,37 @@ def test_h1_followed_by_plain_paragraph_is_preserved():
     assert "这是一段没有统计数字的普通说明文字" in html
 
 
+def test_intro_stats_are_not_rendered_as_report_cards(gen):
+    md = (
+        "# 🗺️ 北京4日游\n\n"
+        "4天1人，人均预算 ¥2,550，核心景点 8 个\n\n"
+        "## 交通建议\n"
+        "| 方向 | 推荐方式 |\n"
+        "|------|----------|\n"
+        "| 去程 | 高铁 |\n"
+    )
+    html = gen.to_html(md, "no-stats")
+    assert 'class="stats-grid"' not in html
+    assert 'class="stat-card"' not in html
+    assert "旅行天数" not in html
+    assert "出行人数" not in html
+    assert "人均预算" not in html
+
+
+def test_report_table_labels_do_not_break_across_lines(gen):
+    html = gen.to_html(
+        "# 🗺️ 测试\n\n"
+        "## 住宿建议\n"
+        "| 档位 | 推荐区域/酒店 |\n"
+        "|------|---------------|\n"
+        "| 经济型 | 测试酒店 |\n",
+        "nowrap",
+    )
+    assert "word-break: keep-all;" in html
+    assert "white-space: nowrap;" in html
+    assert "min-width: 88px;" in html
+
+
 def test_nested_ul_parses_to_children():
     md = (
         "- **分层穿搭方案**：\n"
@@ -185,3 +216,58 @@ def test_to_html_has_hero_and_balanced_divs(gen):
     assert '<div class="hero">' in html
     assert '<div class="container">' in html
     assert html.count("<div") == html.count("</div")
+
+
+def test_to_html_inserts_route_map_near_report_start(gen, monkeypatch):
+    monkeypatch.setattr(
+        "generator.build_route_map_html",
+        lambda markdown: '<div class="route-map-card">MAP</div>\n',
+    )
+    md = (
+        "# 🗺️ 成都3日游\n\n"
+        "3天2人，人均预算 ¥2,000\n\n"
+        "**路线总览** 上海 → 成都。\n\n"
+        "## 🚄 城际交通建议\n"
+        "交通内容\n"
+    )
+
+    html = gen.to_html(md, "route-map")
+
+    assert '<div class="route-map-card">MAP</div>' in html
+    assert html.index('<div class="route-map-card">MAP</div>') < html.index("路线总览")
+
+
+def test_overview_route_and_important_tip_use_emphasis_classes():
+    md = (
+        "# 🗺️ 成都3日游\n\n"
+        "3天2人，人均预算 ¥2,000\n\n"
+        "**路线总览** 上海 → 成都 → 上海。\n\n"
+        "**重要提示：** 本行程为轻松城市漫步，午后避暑。\n"
+    )
+    blocks = _parse_markdown_to_blocks(md)
+    html = _blocks_to_html_fragment(blocks)
+
+    assert 'class="route-overview-card"' in html
+    assert 'class="important-note-card"' in html
+    assert "上海 → 成都 → 上海" in html
+
+
+def test_disclaimer_truncates_followup_content(gen):
+    html = gen.to_html(
+        "# 🗺️ 成都3日游\n\n"
+        "## 行程知识图谱\n"
+        "> **免责声明**：请以官方实时信息为准。\n\n"
+        "- 是否需要调整某天的景点？\n",
+        "truncate-after-disclaimer",
+    )
+
+    assert "免责声明" in html
+    assert "是否需要调整" not in html
+    assert "AI 旅行攻略生成器" not in html
+
+
+def test_to_html_does_not_embed_homepage_logo(gen):
+    html = gen.to_html("# 🗺️ 成都3日游\n\n普通说明\n", "logo")
+
+    assert 'class="brand-logo"' not in html
+    assert "data:image/png;base64," not in html

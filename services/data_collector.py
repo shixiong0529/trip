@@ -1,6 +1,6 @@
 """
 并行数据采集器
-根据用户输入智能拆分查询 → 并行调用携程问道 → 聚合结果为结构化字典
+根据用户输入智能拆分查询 → 并行调用携程问道/12306/高德 → 聚合结果为结构化字典
 """
 
 import asyncio
@@ -28,6 +28,7 @@ async def collect_travel_data(
             "attractions": str,    # 景点门票 Markdown
             "tips": str,           # 实用贴士 Markdown
             "train": str,          # 12306 真实余票参考（origin/destination 均提取成功时才有）
+            "amap": str,           # 高德位置、POI、天气、路线参考（配置 key 且有 destination 时才有）
         }
     """
     client = get_ctrip_client()
@@ -61,18 +62,26 @@ async def collect_travel_data(
     tasks.append(("attractions", attraction_query))
     tasks.append(("tips", tips_query))
 
-    # 并行执行：携程问道四路查询 + 12306 火车票查询（若能提取出发地/目的地）一起并行，
-    # 避免火车票查询把总耗时变成串行相加
+    # 并行执行：携程问道四路查询 + 12306 + 高德参考数据一起并行，
+    # 避免外部接口把总耗时变成串行相加
     labels, queries = zip(*tasks)
     query_many_coro = client.query_many(list(queries))
 
-    train_coro = _query_train_reference(org, dest) if (org and dest) else None
+    extra_coros = []
+    extra_labels = []
+    if org and dest:
+        extra_coros.append(_query_train_reference(org, dest))
+        extra_labels.append("train")
+    if dest:
+        extra_coros.append(_query_amap_reference(dest, org))
+        extra_labels.append("amap")
 
-    if train_coro is not None:
-        results, train_result = await asyncio.gather(query_many_coro, train_coro)
-    else:
-        results = await query_many_coro
-        train_result = ""
+    gathered = await asyncio.gather(query_many_coro, *extra_coros)
+    results = gathered[0]
+    extras = {
+        label: result if isinstance(result, str) else ""
+        for label, result in zip(extra_labels, gathered[1:])
+    }
 
     # 聚合结果
     data = {}
@@ -85,7 +94,8 @@ async def collect_travel_data(
         else:
             data[label] = str(result)
 
-    data["train"] = train_result
+    data["train"] = extras.get("train", "")
+    data["amap"] = extras.get("amap", "")
 
     return data
 
@@ -113,9 +123,20 @@ async def _query_train_reference(org: str, dest: str) -> str:
         return ""
 
 
+async def _query_amap_reference(dest: str, org: Optional[str]) -> str:
+    """调用高德 Web 服务补充 POI/天气/路线数据，失败时返回空串。"""
+    from services.amap_client import collect_amap_reference
+
+    try:
+        return await collect_amap_reference(dest, org)
+    except Exception:
+        return ""
+
+
 def _extract_destination(query: str) -> Optional[str]:
     """简单提取目的地，提取失败返回 None"""
     patterns = [
+        r"(?:从)?[一-龥]{2,4}出发(?:去|到|飞|自驾)?([一-龥]{2,4})(?:玩|旅游|旅行|游|度假|待|自驾|\d|$)",
         r"(?:去|到|在|飞|自驾)([一-龥]{2,4}?)(?:玩|旅游|旅行|游|度假|待|自驾|\d)",
         r"([一-龥]{2,4})\d*日游",
         r"([一-龥]{2,4})(?:旅游|旅行|亲子游|自由行|深度游|美食之旅|赏樱|环线)",

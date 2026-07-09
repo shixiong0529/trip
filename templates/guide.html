@@ -5,42 +5,88 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{{ title }}</title>
 <style>
-  /* ====== HTML Report Generator 设计系统 + 旅行攻略定制 ====== */
+  :root {
+    --bg: #f8f9fa;
+    --card-bg: #ffffff;
+    --text: #475569;
+    --text-strong: #1e293b;
+    --text-muted: #94a3b8;
+    --primary: #2563eb;
+    --accent-green: #16a34a;
+    --accent-gold: #d97706;
+    --accent-red: #dc2626;
+    --border: #e2e8f0;
+    --highlight: #eff6ff;
+    --muted-surface: #f1f5f9;
+    --shadow: 0 1px 3px rgba(0,0,0,.06), 0 1px 2px rgba(0,0,0,.04);
+    --shadow-lg: 0 4px 12px rgba(0,0,0,.08);
+    --radius: 12px;
+    --radius-sm: 8px;
+  }
   * { margin:0; padding:0; box-sizing:border-box; }
   body {
-    font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif;
-    background: #f8f9fa;
-    color: #1a1a2e;
+    font-family: -apple-system, PingFang SC, Microsoft YaHei, sans-serif;
+    background: var(--bg);
+    color: var(--text);
     line-height: 1.7;
     min-height: 100vh;
   }
 
   /* Hero */
   .hero {
-    background: linear-gradient(135deg, #e8f0fe, #dbeafe);
-    padding: 56px 40px 48px;
+    background: linear-gradient(135deg, #1e3a5f 0%, #2d5a87 40%, #1a3a5c 100%);
+    color: #fff;
+    border-radius: var(--radius);
+    padding: 48px 20px 40px;
     text-align: center;
-    border-bottom: 1px solid rgba(37,99,235,0.1);
+    margin-bottom: 32px;
+    position: relative;
+    overflow: hidden;
+    box-shadow: var(--shadow-lg);
+  }
+  .hero::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 800 400'%3E%3Cpath d='M0 300 Q200 100 400 200 T800 150' fill='none' stroke='rgba(255,255,255,.06)' stroke-width='2'/%3E%3Cpath d='M0 350 Q200 200 400 280 T800 220' fill='none' stroke='rgba(255,255,255,.04)' stroke-width='3'/%3E%3C/svg%3E");
+    background-size: cover;
   }
   .hero h1 {
-    font-size: 2em;
-    font-weight: 800;
-    color: #1a1a2e;
+    font-size: 2rem;
+    font-weight: 700;
+    color: #fff;
     line-height: 1.3;
-    max-width: 860px;
+    letter-spacing: .02em;
+    max-width: 900px;
     margin: 0 auto;
+    position: relative;
   }
   .hero .meta {
+    margin-top: 8px;
+    color: rgba(255,255,255,.8);
+    font-size: 1rem;
+    position: relative;
+  }
+  .hero .tags {
     margin-top: 16px;
-    color: #64748b;
-    font-size: 0.9em;
+    position: relative;
+  }
+  .hero .tag {
+    display: inline-block;
+    background: rgba(255,255,255,.15);
+    border-radius: 20px;
+    padding: 4px 14px;
+    margin: 3px 5px;
+    color: #fff;
+    font-size: .8rem;
+    backdrop-filter: blur(4px);
   }
 
   /* Container */
   .container {
-    max-width: 900px;
+    max-width: 1000px;
     margin: 0 auto;
-    padding: 32px 24px 60px;
+    padding: 24px 20px 60px;
   }
 
   /* Section */
@@ -48,12 +94,13 @@
     margin-bottom: 36px;
   }
   .section-title {
-    font-size: 1.15em;
+    font-size: 1.35rem;
     font-weight: 700;
-    color: #1a1a2e;
+    color: var(--text-strong);
     margin-bottom: 16px;
-    padding-bottom: 10px;
-    border-bottom: 2px solid #2563eb;
+    padding: 0 0 0 14px;
+    border-left: 4px solid var(--primary);
+    border-bottom: none;
     display: flex;
     align-items: center;
     gap: 10px;
@@ -62,34 +109,125 @@
     font-size: 1.2em;
   }
   .sub-title {
-    font-size: 1em;
+    font-size: 1rem;
     font-weight: 700;
-    color: #1a1a2e;
+    color: var(--text-strong);
     margin: 18px 0 10px;
   }
 
   /* Cards */
   .card {
-    background: #fff;
-    border: 1px solid rgba(0,0,0,0.06);
-    border-radius: 14px;
-    padding: 22px 24px;
-    margin-bottom: 14px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 24px;
+    margin-bottom: 16px;
+    box-shadow: var(--shadow);
   }
   .card h3 {
-    color: #1a1a2e;
-    font-size: 0.98em;
+    color: var(--text-strong);
+    font-size: .98rem;
     margin-bottom: 10px;
   }
   .card p, .card li {
-    color: #475569;
-    font-size: 0.88em;
+    color: var(--text);
+    font-size: .88rem;
     line-height: 1.75;
   }
   .card ul {
     padding-left: 20px;
     margin-top: 6px;
+  }
+
+  .route-overview-card {
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 26px 28px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow-lg);
+    border-left: 5px solid var(--primary);
+  }
+  .route-overview-card p {
+    color: var(--text-strong);
+    font-size: 1.16rem;
+    font-weight: 700;
+    line-height: 1.8;
+  }
+  .route-overview-card strong {
+    color: var(--primary);
+    font-size: 1.2rem;
+  }
+  .important-note-card {
+    background: #fff5f5;
+    border: 1px solid #fecaca;
+    border-radius: 18px;
+    padding: 26px 30px;
+    margin-bottom: 24px;
+    box-shadow: none;
+  }
+  .important-note-card p {
+    color: #991b1b;
+    font-size: .88rem;
+    font-weight: 500;
+    line-height: 1.9;
+  }
+  .important-note-card strong {
+    color: #dc2626;
+    font-weight: 800;
+  }
+
+  /* Route map */
+  .route-map-card {
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 20px;
+    margin-bottom: 24px;
+    box-shadow: var(--shadow-lg);
+    overflow-x: auto;
+  }
+  .route-map-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .route-map-header h2 {
+    font-size: 1.1rem;
+    color: var(--text-strong);
+    margin: 0;
+    white-space: nowrap;
+  }
+  .route-map-header p {
+    color: var(--text-muted);
+    font-size: .78rem;
+    line-height: 1.5;
+    text-align: right;
+  }
+  .route-map-image {
+    display: block;
+    width: 100%;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+  }
+  .route-map-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 12px;
+  }
+  .route-map-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    background: var(--muted-surface);
+    border: 1px solid var(--border);
+    border-radius: 20px;
+    color: var(--text);
+    font-size: .78rem;
+    padding: 5px 9px;
+  }
+  .route-map-chip strong {
+    color: var(--primary);
   }
 
   /* Stats grid */
@@ -100,49 +238,55 @@
     margin-bottom: 20px;
   }
   .stat-card {
-    background: #fff;
-    border: 1px solid rgba(0,0,0,0.06);
-    border-radius: 12px;
-    padding: 16px;
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 18px 16px;
     text-align: center;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    box-shadow: var(--shadow);
   }
   .stat-value {
-    font-size: 1.6em;
-    font-weight: 800;
-    color: #2563eb;
+    font-size: 1.6rem;
+    font-weight: 700;
+    color: var(--primary);
     line-height: 1.2;
   }
   .stat-label {
-    font-size: 0.78em;
-    color: #64748b;
+    font-size: .8rem;
+    color: var(--text-muted);
     margin-top: 4px;
   }
 
   /* Day card */
   .day-card {
-    background: #fff;
-    border: 1px solid rgba(0,0,0,0.06);
-    border-radius: 14px;
-    margin-bottom: 16px;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
-    overflow: hidden;
+    background: var(--card-bg);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 14px;
+    box-shadow: var(--shadow);
+    border-left: 4px solid var(--primary);
+    transition: box-shadow .2s;
   }
+  .day-card:hover { box-shadow: var(--shadow-lg); }
   .day-header {
-    background: linear-gradient(135deg, #eff6ff, #f8fafc);
-    padding: 16px 20px;
-    border-bottom: 1px solid rgba(37,99,235,0.08);
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+    padding: 0;
+    margin-bottom: 12px;
+    border-bottom: none;
   }
   .day-header h3 {
-    color: #1a1a2e;
-    font-size: 1.05em;
+    color: var(--text-strong);
+    font-size: 1.1rem;
     font-weight: 700;
     margin: 0;
+    white-space: nowrap;
   }
   .day-header .day-route {
-    color: #64748b;
-    font-size: 0.82em;
-    margin-top: 4px;
+    color: var(--primary);
+    font-size: .85rem;
+    font-weight: 600;
   }
   .day-header .day-route .badge {
     margin-left: 8px;
@@ -151,13 +295,13 @@
     padding: 0;
   }
   .day-footer {
-    background: #f8fafc;
-    padding: 12px 20px;
-    border-top: 1px solid rgba(0,0,0,0.04);
+    background: transparent;
+    padding: 12px 0 0;
+    border-top: 1px solid var(--border);
     display: flex;
     gap: 16px;
     flex-wrap: wrap;
-    font-size: 0.85em;
+    font-size: .85rem;
   }
 
   /* Tables */
@@ -168,22 +312,31 @@
   table {
     width: 100%;
     border-collapse: collapse;
-    font-size: 0.85em;
+    font-size: .88rem;
+    word-break: keep-all;
   }
   th {
-    background: rgba(37,99,235,0.06);
-    color: #2563eb;
+    background: var(--muted-surface);
+    color: #334155;
     font-weight: 600;
-    padding: 12px 16px;
+    padding: 10px 12px;
     text-align: left;
-    border-bottom: 2px solid rgba(37,99,235,0.1);
+    border-bottom: 1px solid var(--border);
     white-space: nowrap;
+    font-size: .8rem;
+    text-transform: uppercase;
+    letter-spacing: .04em;
   }
   td {
-    color: #475569;
-    padding: 12px 16px;
-    border-bottom: 1px solid rgba(0,0,0,0.04);
+    color: var(--text);
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
     vertical-align: top;
+  }
+  th:first-child,
+  td:first-child {
+    min-width: 88px;
+    white-space: nowrap;
   }
   tr:hover td {
     background: rgba(37,99,235,0.02);
@@ -194,14 +347,14 @@
   .day-body td:first-child {
     width: 70px;
     white-space: nowrap;
-    color: #2563eb;
+    color: var(--primary);
     font-weight: 600;
   }
 
   /* Lists */
   ul, ol {
     margin: 8px 0 8px 22px;
-    color: #475569;
+    color: var(--text);
   }
   li {
     margin: 5px 0;
@@ -227,57 +380,56 @@
   .badge {
     display: inline-block;
     padding: 3px 10px;
-    border-radius: 10px;
-    font-size: 0.78em;
+    border-radius: 4px;
+    font-size: .78rem;
     font-weight: 600;
   }
   .badge-blue {
-    background: rgba(37,99,235,0.08);
-    color: #2563eb;
-    border: 1px solid rgba(37,99,235,0.15);
+    background: var(--highlight);
+    color: var(--primary);
+    border: none;
   }
   .badge-green {
     background: rgba(22,163,74,0.08);
-    color: #16a34a;
-    border: 1px solid rgba(22,163,74,0.15);
+    color: var(--accent-green);
+    border: none;
   }
   .badge-orange {
-    background: rgba(217,119,6,0.08);
-    color: #d97706;
-    border: 1px solid rgba(217,119,6,0.15);
+    background: #fef3c7;
+    color: #92400e;
+    border: none;
   }
   .badge-red {
-    background: rgba(220,38,38,0.08);
-    color: #dc2626;
-    border: 1px solid rgba(220,38,38,0.15);
+    background: #fef2f2;
+    color: var(--accent-red);
+    border: none;
   }
 
   /* Quote / note */
   blockquote {
-    background: linear-gradient(135deg, rgba(37,99,235,0.04), rgba(37,99,235,0.01));
-    border-left: 3px solid #2563eb;
-    border-radius: 0 12px 12px 0;
-    padding: 14px 20px;
+    background: #fffbeb;
+    border-left: 4px solid var(--accent-gold);
+    border-radius: var(--radius);
+    padding: 18px 20px;
     margin: 12px 0;
-    color: #475569;
-    font-size: 0.88em;
-    font-style: italic;
+    color: var(--text);
+    font-size: .88rem;
+    font-style: normal;
   }
   blockquote p {
-    color: #475569;
+    color: var(--text);
   }
 
   /* Knowledge graph tree */
   .tree {
-    background: #fff;
-    border: 1px solid rgba(0,0,0,0.06);
-    border-radius: 14px;
+    background: var(--card-bg);
+    border-radius: var(--radius);
     padding: 22px 24px;
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     font-size: 0.82em;
     line-height: 2;
-    color: #475569;
-    box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+    color: var(--text);
+    box-shadow: var(--shadow);
     white-space: pre-wrap;
     overflow-x: auto;
   }
@@ -310,7 +462,7 @@
     body { background: #fff; }
     .hero { padding: 24px; }
     .container { padding: 0; }
-    .card, .day-card, .tree { box-shadow: none; border: 1px solid #e2e8f0; }
+    .card, .day-card, .tree, .route-map-card { box-shadow: none; border: 1px solid #e2e8f0; }
     .day-card { break-inside: avoid; page-break-inside: avoid; }
     .section-title { break-after: avoid; }
   }
@@ -322,6 +474,23 @@
     .container { padding: 24px 16px; }
     .stats-grid { grid-template-columns: repeat(2, 1fr); }
     .card, .day-header, .day-footer { padding: 16px; }
+    .route-overview-card,
+    .important-note-card {
+      padding: 18px;
+      border-radius: var(--radius);
+    }
+    .route-overview-card p {
+      font-size: 1rem;
+    }
+    .route-map-card { padding: 14px; }
+    .route-map-header {
+      align-items: flex-start;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .route-map-header p {
+      text-align: left;
+    }
     th, td { padding: 10px 12px; font-size: 0.8em; }
   }
 </style>
@@ -329,10 +498,6 @@
 <body>
 
 {{ body_html | safe }}
-
-<p style="text-align:center;color:#94a3b8;font-size:0.75em;margin-top:48px;border-top:1px solid #e2e8f0;padding-top:20px;">
-  AI 旅行攻略生成器 · 攻略编号 {{ guide_id }} · 价格信息仅供参考，请以官方实时为准
-</p>
 
 </body>
 </html>

@@ -19,6 +19,7 @@ from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
+from services.route_map import build_route_map_html
 
 logger = logging.getLogger(__name__)
 
@@ -168,7 +169,7 @@ def _parse_table(lines: list[str]) -> list[list[str]]:
 
 
 # ---------- HTML 生成 ----------
-def _blocks_to_html_fragment(blocks: list[dict]) -> str:
+def _blocks_to_html_fragment(blocks: list[dict], route_map_html: str = "") -> str:
     """将块转为 HTML Report Generator 风格的片段"""
     html = ""
     i = 0
@@ -184,6 +185,8 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
         if t == "h1":
             html += _render_hero(content)
             in_container = True
+            if route_map_html:
+                html += route_map_html
             # 接下来的 1-3 个段落通常是概览统计 + 路线总览 + 重要提示
             overview_paras = []
             j = i + 1
@@ -253,11 +256,13 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
         # 引用块
         elif t == "blockquote":
             html += f'<blockquote>{_inline_md(content)}</blockquote>\n'
+            if "免责声明" in content or "免责申明" in content:
+                break
 
         # 普通段落
         elif t == "p":
             # 重要提示 / 预算说明 等段落用 card 包裹
-            html += f'<div class="card"><p>{_inline_md(content)}</p></div>\n'
+            html += _render_paragraph_card(content)
 
         i += 1
 
@@ -270,34 +275,42 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
 
 def _render_hero(title: str) -> str:
     """渲染 Hero 区"""
-    return f'''<div class="hero">
+    return f'''<div class="container">
+<div class="hero">
   <h1>{_inline_md(title)}</h1>
   <p class="meta">AI 旅行管家 · 路小鲜（Leo）定制</p>
+  <div class="tags">
+    <span class="tag">多源数据</span>
+    <span class="tag">高德路线图</span>
+    <span class="tag">可执行行程</span>
+  </div>
 </div>
-<div class="container">\n'''
+'''
 
 
 def _render_overview(paras: list[str]) -> str:
-    """渲染概览区：统计卡片 + 路线总览 + 重要提示"""
+    """渲染概览区：跳过开头统计句，保留路线总览 + 重要提示"""
     html = ""
 
-    # 从第一段提取关键统计数字；提取到 ≥2 项才视为"统计段"，
-    # 否则按普通段落输出，避免 H1 后的正文段落被静默丢弃
+    # 首段若是"4天1人，人均预算..."这类统计句，不再渲染为报告开头卡片。
     stats = _extract_stats(paras[0]) if paras else []
     rest = paras[1:]
-    if len(stats) >= 2:
-        html += '<div class="stats-grid">\n'
-        for label, value in stats:
-            html += f'  <div class="stat-card"><div class="stat-value">{value}</div><div class="stat-label">{label}</div></div>\n'
-        html += '</div>\n'
-    else:
+    if len(stats) < 2:
         rest = paras
 
-    # 路线总览 + 重要提示用 card 包裹
     for p in rest:
-        html += f'<div class="card"><p>{_inline_md(p)}</p></div>\n'
+        html += _render_paragraph_card(p)
 
     return html
+
+
+def _render_paragraph_card(content: str) -> str:
+    """根据段落语义渲染重点卡片。"""
+    if "路线总览" in content:
+        return f'<div class="route-overview-card"><p>{_inline_md(content)}</p></div>\n'
+    if "重要提示" in content:
+        return f'<div class="important-note-card"><p>{_inline_md(content)}</p></div>\n'
+    return f'<div class="card"><p>{_inline_md(content)}</p></div>\n'
 
 
 def _extract_stats(text: str) -> list[tuple[str, str]]:
@@ -471,7 +484,8 @@ class TravelGuideGenerator:
     def to_html(self, markdown_content: str, guide_id: str) -> str:
         """Markdown → 完整 HTML 页面"""
         blocks = _parse_markdown_to_blocks(markdown_content)
-        body_html = _blocks_to_html_fragment(blocks)
+        route_map_html = build_route_map_html(markdown_content)
+        body_html = _blocks_to_html_fragment(blocks, route_map_html=route_map_html)
 
         # 尝试从 h1 提取标题
         title = "旅行攻略"

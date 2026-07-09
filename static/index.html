@@ -9,13 +9,12 @@
 <body>
 
 <div class="bg-scene" aria-hidden="true"></div>
-<div class="bg-veil" aria-hidden="true"></div>
 
 <!-- ====== 悬浮导航 ====== -->
 <header class="app-header">
   <div class="header-inner">
     <div class="logo-area">
-      <span class="logo-icon">&#x2708;&#xFE0F;</span>
+      <img class="logo-icon" src="/static/logo-nav.png" alt="路小鲜">
       <span class="app-title">路小鲜<span class="title-dot">·</span>AI 旅行攻略</span>
     </div>
     <nav class="header-nav">
@@ -32,9 +31,9 @@
   <section class="input-section" id="input-section">
     <div class="input-container">
       <div class="input-header">
-        <p class="eyebrow">AI AGENT · 实时数据 · 三格式导出</p>
+        <p class="eyebrow">AI AGENT · 实时数据</p>
         <h2>你想去哪里旅行？</h2>
-        <p class="input-desc">告诉我目的地、天数、预算和偏好，AI 结合实时票价数据，帮你规划一份可以直接照着走的行程</p>
+        <p class="input-desc">告诉我目的地、天数和旅行偏好，AI 结合实时数据，帮你规划一份可以直接照着走的行程</p>
       </div>
 
       <div class="input-box">
@@ -58,10 +57,6 @@
         <button class="tag" data-query="成都美食之旅4天，1人，预算3000元，纯吃纯玩">&#x1F959; 成都美食之旅</button>
       </div>
 
-      <div class="status-bar" id="status-bar">
-        <span class="status-dot" id="status-dot"></span>
-        <span id="status-text">检测服务状态中...</span>
-      </div>
     </div>
   </section>
 
@@ -115,7 +110,22 @@
 
 <!-- ====== Footer ====== -->
 <footer class="app-footer">
-  <p>AI 旅行攻略生成器 · 攻略内容由 AI 生成，具体价格和营业时间请以实际为准</p>
+  <div class="footer-note">
+    <p class="footer-kicker">NOTA BENE · 附注</p>
+    <p class="footer-copy">本工具基于人工智能与互联网检索生成参考方案，数据可能存在延迟或偏差。出行预订、价格、营业时间和签证政策请以官方实时信息为准。</p>
+  </div>
+  <div class="footer-bottom">
+    <div class="footer-brand">
+      <span class="footer-mark">路</span>
+      <span>© 2026 路小鲜 · LUXIAN TRAVEL ADVISORY</span>
+    </div>
+    <nav class="footer-links" aria-label="页脚链接">
+      <a href="/info#data-source">数据来源</a>
+      <a href="/info#privacy">隐私政策</a>
+      <a href="/info#terms">服务条款</a>
+      <a href="/info#contact">联系我们</a>
+    </nav>
+  </div>
 </footer>
 
 <script src="/static/app.js"></script>

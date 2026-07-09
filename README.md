@@ -1,11 +1,11 @@
 # AI 旅行攻略生成器
 
-输入目的地，秒出详细行程。基于携程问道实时数据 + DeepSeek AI 编排，生成可直接照着走的旅行攻略，支持 HTML / PDF / DOCX 三格式下载。
+输入目的地，秒出详细行程。基于携程问道、高德 Web 服务、12306 等数据 + DeepSeek AI 编排，生成可直接照着走的旅行攻略，支持 HTML / PDF / DOCX 三格式下载。
 
 ## 功能
 
 - **对话式输入** — 自然语言描述需求，无需填表单。如"武汉出发自驾西藏15天，2人，预算15000元"
-- **实时数据** — 携程问道查询机票/酒店/景点门票的实时价格和预约规则，注入 LLM 上下文
+- **多源数据** — 携程问道查询机票/酒店/景点门票，高德补充定位/POI/天气/路线，12306 补充火车余票参考，统一注入 LLM 上下文
 - **结构化输出** — 概览统计、天气穿搭、交通、住宿、逐日行程表、预算拆解、预约清单、避坑提示、行前物品、知识图谱
 - **多格式下载** — 网页预览（精美 HTML 样式） + PDF 下载 + DOCX 下载
 - **行程记忆** — SQLite 本地存储历史行程，支持查看、删除
@@ -17,7 +17,7 @@
 |---|---|
 | 后端 | Python 3.13 + FastAPI + uvicorn |
 | LLM | DeepSeek API（兼容 OpenAI 接口） |
-| 实时数据 | 携程问道 API |
+| 实时数据 | 携程问道 API + 高德 Web 服务 + 12306 |
 | 文档生成 | Jinja2 + WeasyPrint (PDF) + python-docx (DOCX) |
 | 存储 | SQLite（行程记忆） + 内存缓存（攻略临时缓存，1小时有效） |
 | 前端 | 纯 HTML/CSS/JS（零依赖） |
@@ -39,7 +39,7 @@ LLM_API_KEY=sk-your-key-here
 LLM_MODEL=deepseek-chat
 ```
 
-> 携程问道 API Key 通过环境变量 `WENDAO_API_KEY` 注入。如果已在 WorkBuddy 连接器中配置，无需额外操作。
+> 携程问道 API Key 通过环境变量 `WENDAO_API_KEY` 注入。如果已在 WorkBuddy 连接器中配置，无需额外操作。高德 Web 服务 Key 可填入 `AMAP_WEB_SERVICE_KEY`，用于目的地定位、POI、天气和路线距离参考。
 
 ### 2. 安装依赖
 
@@ -91,7 +91,7 @@ apt install libpango-1.0-0 libcairo2 libgobject-2.0-0
 | `GET /api/trips` | 列出历史行程 |
 | `GET /api/trips/{id}` | 行程详情 |
 | `DELETE /api/trips/{id}` | 删除行程 |
-| `GET /api/flight/track` | 航班实时追踪（OpenSky） |
+| `GET /api/flight/track` | 航班实时追踪，`?callsign=MU5100&date=YYYY-MM-DD` 或 `?airport=ZBAA`。按航班号查询时优先飞猪航班动态（需配置 `FLIGGY_APP_KEY/SECRET`），未配置回退 OpenSky |
 | `GET /api/weather/aviation` | 航空气象 METAR/TAF |
 | `GET /api/train/tickets` | 12306 余票查询，`?from_station&to_station&date` |
 | `GET /api/flights/search` | 国际机票查询（Google Flights），`?origin&destination&date&nonstop&passengers` |
@@ -109,7 +109,8 @@ FastAPI 服务 (app.py)
     ├── config.py           ← 配置管理
     ├── services/
     │   ├── ctrip_client.py      ← 携程问道 API
-    │   ├── data_collector.py    ← 四路并行数据采集
+    │   ├── data_collector.py    ← 多源并行数据采集
+    │   ├── amap_client.py       ← 高德 Web 服务：定位/POI/天气/路线
     │   ├── flight_search.py     ← Google Flights 国际机票
     │   ├── flight_tracker.py    ← OpenSky 航班追踪
     │   ├── train_service.py     ← 12306 查票
@@ -125,7 +126,7 @@ FastAPI 服务 (app.py)
 用户输入 "西藏15日自驾"
     │
     ▼
-携程问道并行采集（4 路）
+多源接口并行采集
   ├── 交通数据（机票/火车票）
   ├── 酒店推荐
   ├── 景点门票

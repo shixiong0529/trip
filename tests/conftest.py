@@ -35,6 +35,7 @@ os.environ.setdefault("TRIP_STORE_DB_PATH", str(Path(_SESSION_DB_DIR) / "session
 # 测试全程不触网：即便某处遗漏 monkeypatch，没有 WENDAO_API_KEY 也会让
 # CtripClient() 构造直接抛 ValueError，而不是真的发起 HTTP 请求。
 os.environ["WENDAO_API_KEY"] = ""
+os.environ["AMAP_WEB_SERVICE_KEY"] = ""
 
 import pytest  # noqa: E402
 

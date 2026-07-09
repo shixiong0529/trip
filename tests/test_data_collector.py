@@ -64,12 +64,27 @@ def test_collect_travel_data_keys(monkeypatch):
     )
     # 无法提取出发地时不会触发 12306 查询
     data = asyncio.run(collect_travel_data("我想去西藏玩18天"))
-    assert set(data.keys()) == {"transport", "hotels", "attractions", "tips", "train"}
+    assert set(data.keys()) == {"transport", "hotels", "attractions", "tips", "train", "amap"}
     assert data["transport"]
     assert data["hotels"]
     assert data["attractions"]
     assert data["tips"]
     assert data["train"] == ""
+    assert data["amap"] == ""
+
+
+def test_collect_travel_data_injects_amap_when_destination_present(monkeypatch):
+    monkeypatch.setattr(
+        "services.data_collector.get_ctrip_client", lambda: _FakeCtripClient()
+    )
+
+    async def fake_query_amap_reference(dest, org):
+        return f"高德位置数据: {org or '未知'} -> {dest}"
+
+    monkeypatch.setattr("services.data_collector._query_amap_reference", fake_query_amap_reference)
+
+    data = asyncio.run(collect_travel_data("上海出发成都3日游"))
+    assert data["amap"] == "高德位置数据: 上海 -> 成都"
 
 
 def test_collect_travel_data_injects_train_when_org_and_dest_present(monkeypatch):
