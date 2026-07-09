@@ -1,0 +1,302 @@
+"""
+FastAPI 应用主入口
+- 静态文件服务
+- API 路由定义
+- SSE 流式响应
+"""
+
+import uuid
+import asyncio
+from pathlib import Path
+
+from fastapi import FastAPI, Request, Query, HTTPException
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    StreamingResponse,
+    FileResponse,
+    Response,
+)
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+
+from config import llm_config, app_config
+
+# ---------- 创建应用 ----------
+app = FastAPI(
+    title="AI 旅行攻略生成器",
+    description="输入目的地，秒出详细行程。支持 HTML/PDF/DOCX 三格式下载。",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- 攻略缓存（SQLite 持久化，见 services/trip_store.py） ----------
+
+def _clean_cache():
+    """清理过期缓存"""
+    from services import trip_store
+    trip_store.clean_expired_guides(app_config.guide_cache_ttl)
+
+
+# ---------- 健康检查 ----------
+@app.get("/api/health")
+async def health_check():
+    import os
+    ctrip_ready = bool(os.getenv("WENDAO_API_KEY", "").strip())
+    return {
+        "status": "ok",
+        "llm_configured": llm_config.is_configured,
+        "model": llm_config.model,
+        "ctrip_ready": ctrip_ready,
+    }
+
+
+# ---------- 生成攻略（SSE 流式） ----------
+@app.post("/api/generate")
+async def generate_guide(request: Request):
+    from orchestrator import TravelGuideOrchestrator, LLMClientError
+
+    body = await request.json()
+    query = body.get("query", "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="请输入旅行需求")
+
+    # 前端可传覆盖配置
+    user_config = body.get("config", {}) or {}
+
+    try:
+        orchestrator = TravelGuideOrchestrator(
+            base_url=user_config.get("base_url") or llm_config.base_url,
+            api_key=user_config.get("api_key") or llm_config.api_key,
+            model=user_config.get("model") or llm_config.model,
+        )
+    except LLMClientError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    def _sse_line(text: str) -> str:
+        # SSE 的 data 字段不允许包含裸换行，压成单行
+        return " ".join(str(text).splitlines())
+
+    async def event_stream():
+        full_markdown = ""
+        guid = ""
+        try:
+            async for event in orchestrator.generate(query):
+                if event["type"] == "content":
+                    full_markdown += event["data"]
+                    # SSE 多行格式：数据含 \n 时拆为多个 data: 行
+                    data = event["data"]
+                    if "\n" in data:
+                        lines = "\n".join(f"data: {line}" for line in data.split("\n"))
+                    else:
+                        lines = f"data: {data}"
+                    yield f"event: content\n{lines}\n\n"
+                elif event["type"] == "progress":
+                    yield f"event: progress\ndata: {_sse_line(event['data'])}\n\n"
+                elif event["type"] == "error":
+                    yield f"event: error\ndata: {_sse_line(event['data'])}\n\n"
+                    return
+
+            # 生成完成后，渲染 HTML
+            guid = str(uuid.uuid4())[:8]
+            from generator import TravelGuideGenerator
+            gen = TravelGuideGenerator(app_config.templates_dir)
+            html_content = gen.to_html(full_markdown, guid)
+
+            # 缓存
+            _clean_cache()
+            from services import trip_store
+            trip_store.save_guide(guid, html_content, full_markdown)
+
+            # 发送 result 事件
+            import json
+            result_data = json.dumps({
+                "guide_id": guid,
+                "html": html_content,
+            }, ensure_ascii=False)
+            yield f"event: result\ndata: {result_data}\n\n"
+            yield "event: done\ndata: {}\n\n"
+
+        except Exception as e:
+            yield f"event: error\ndata: {_sse_line(e)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------- 下载攻略 ----------
+@app.get("/api/download/{guide_id}")
+async def download_guide(guide_id: str, format: str = Query("html")):
+    from services import trip_store
+    _clean_cache()
+    guide = trip_store.get_guide(guide_id)
+    if not guide:
+        raise HTTPException(status_code=404, detail="攻略已过期或不存在，请重新生成")
+
+    from generator import TravelGuideGenerator
+    gen = TravelGuideGenerator(app_config.templates_dir)
+
+    if format == "pdf":
+        try:
+            pdf_bytes = gen.to_pdf(guide["html"], guide_id)
+            return Response(
+                content=pdf_bytes,
+                media_type="application/pdf",
+                headers={"Content-Disposition": f"attachment; filename=travel-guide-{guide_id}.pdf"},
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e))
+
+    elif format == "docx":
+        docx_bytes = gen.to_docx(guide["markdown"], guide_id)
+        return Response(
+            content=docx_bytes,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": f"attachment; filename=travel-guide-{guide_id}.docx"},
+        )
+
+    else:
+        # 默认 HTML
+        return HTMLResponse(content=guide["html"])
+
+
+# ---------- 行程管理 ----------
+@app.post("/api/trips")
+async def save_trip(request: Request):
+    """保存行程到本地数据库
+
+    若请求体缺 destination/days/travelers/budget，尝试从 markdown 和
+    destination（原始查询文本）中自动解析，解析失败则保留默认值。
+    """
+    from services import trip_store
+    body = await request.json()
+    markdown = body.get("markdown", "")
+    raw_destination = body.get("destination", "")
+
+    destination = raw_destination
+    days = body.get("days")
+    travelers = body.get("travelers")
+    budget = body.get("budget")
+
+    if not destination or days is None or travelers is None or budget is None:
+        parsed = trip_store.parse_trip_fields(raw_destination, markdown)
+        if not destination:
+            destination = parsed["destination"] or "未知目的地"
+        if days is None:
+            days = parsed["days"] if parsed["days"] is not None else 0
+        if travelers is None:
+            travelers = parsed["travelers"] if parsed["travelers"] is not None else 1
+        if budget is None:
+            budget = parsed["budget"] if parsed["budget"] is not None else 0
+
+    trip_id = trip_store.save_trip(
+        destination=destination or "未知目的地",
+        markdown=markdown,
+        origin=body.get("origin", ""),
+        start_date=body.get("start_date", ""),
+        end_date=body.get("end_date", ""),
+        days=days,
+        travelers=travelers,
+        budget=budget,
+        preferences=body.get("preferences", ""),
+    )
+    return {"trip_id": trip_id, "status": "saved"}
+
+
+@app.get("/api/trips")
+async def list_trips():
+    """列出历史行程"""
+    from services import trip_store
+    trips = trip_store.list_trips()
+    return {"trips": trips}
+
+
+@app.get("/api/trips/{trip_id}")
+async def get_trip(trip_id: str):
+    """获取行程详情"""
+    from services import trip_store
+    trip = trip_store.get_trip(trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="行程不存在")
+    return trip
+
+
+@app.get("/api/trips/{trip_id}/view")
+async def view_trip(trip_id: str):
+    """将保存的行程 markdown 渲染为 HTML 并返回"""
+    from services import trip_store
+    trip = trip_store.get_trip(trip_id)
+    if not trip:
+        raise HTTPException(status_code=404, detail="行程不存在")
+
+    from generator import TravelGuideGenerator
+    gen = TravelGuideGenerator(app_config.templates_dir)
+    html_content = gen.to_html(trip.get("markdown") or "", trip_id)
+    return HTMLResponse(content=html_content)
+
+
+@app.delete("/api/trips/{trip_id}")
+async def delete_trip(trip_id: str):
+    """删除行程"""
+    from services import trip_store
+    if trip_store.delete_trip(trip_id):
+        return {"status": "deleted"}
+    raise HTTPException(status_code=404, detail="行程不存在")
+
+
+# ---------- 实时服务 API ----------
+@app.get("/api/flight/track")
+async def track_flight(airport: str = Query(""), callsign: str = Query("")):
+    """实时航班追踪"""
+    from services import flight_tracker
+    if callsign:
+        result = await flight_tracker.track_by_callsign(callsign)
+    elif airport:
+        result = await flight_tracker.track_by_airport(airport)
+    else:
+        raise HTTPException(status_code=400, detail="请提供 airport 或 callsign 参数")
+    return {"data": result}
+
+
+@app.get("/api/weather/aviation")
+async def aviation_weather(airport: str = Query(...)):
+    """航空气象查询"""
+    from services import weather_service
+    metar = await weather_service.get_metar(airport)
+    taf = await weather_service.get_taf(airport)
+    return {"metar": metar, "taf": taf}
+
+
+# ---------- 挂载静态文件 ----------
+static_dir = Path(__file__).parent / "static"
+static_dir.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+
+# ---------- 首页 ----------
+@app.get("/")
+async def index():
+    index_path = static_dir / "index.html"
+    if index_path.exists():
+        return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
+    return HTMLResponse("<h1>AI 旅行攻略生成器</h1><p>前端页面尚未创建。</p>")
+
+
+# ---------- 启动入口 ----------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=app_config.host, port=app_config.port)

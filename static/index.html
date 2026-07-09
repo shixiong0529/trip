@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 旅行攻略生成器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<!-- ====== Header ====== -->
+<header class="app-header">
+  <div class="header-inner">
+    <div class="logo-area">
+      <span class="logo-icon">&#x2708;</span>
+      <div>
+        <h1 class="app-title">AI 旅行攻略生成器</h1>
+        <p class="app-subtitle">输入目的地，秒出详细行程</p>
+      </div>
+    </div>
+    <button class="btn-icon" id="btn-settings" title="设置">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+    </button>
+    <nav class="header-nav">
+      <button class="nav-tab active" data-tab="generate">生成攻略</button>
+      <button class="nav-tab" data-tab="trips">我的行程</button>
+    </nav>
+  </div>
+</header>
+
+<!-- ====== 设置面板 ====== -->
+<div class="settings-overlay" id="settings-overlay">
+  <div class="settings-panel">
+    <div class="settings-header">
+      <h3>API 配置</h3>
+      <button class="btn-close" id="btn-close-settings">&times;</button>
+    </div>
+    <div class="settings-body">
+      <div class="form-group">
+        <label>LLM Base URL</label>
+        <input type="text" id="cfg-base-url" placeholder="https://api.deepseek.com/v1">
+      </div>
+      <div class="form-group">
+        <label>API Key</label>
+        <input type="password" id="cfg-api-key" placeholder="sk-...">
+      </div>
+      <div class="form-group">
+        <label>模型名称</label>
+        <input type="text" id="cfg-model" placeholder="deepseek-chat">
+      </div>
+      <button class="btn btn-primary btn-full" id="btn-save-config">保存配置</button>
+      <p class="config-hint">配置保存在浏览器本地；生成攻略时 API Key 仅经本服务转发给 LLM 服务商，不做存储。</p>
+    </div>
+  </div>
+</div>
+
+<!-- ====== 主内容区 ====== -->
+<main class="main-content">
+
+  <!-- 初始状态：输入 -->
+  <section class="input-section" id="input-section">
+    <div class="input-container">
+      <div class="input-header">
+        <h2>你想去哪里旅行？</h2>
+        <p class="input-desc">告诉我目的地、天数、预算和偏好，AI 帮你规划完美行程</p>
+      </div>
+
+      <div class="input-box">
+        <textarea
+          id="query-input"
+          rows="3"
+          placeholder="例如：我想去西藏玩18天，2个人，预算15000元，喜欢自然风光和文化体验..."
+          maxlength="2000"
+        ></textarea>
+        <div class="input-footer">
+          <span class="char-count"><span id="char-count">0</span>/2000</span>
+          <button class="btn btn-primary" id="btn-generate">
+            <span class="btn-text">生成攻略</span>
+            <span class="btn-loading" style="display:none">
+              <span class="spinner"></span> 生成中...
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <div class="quick-tags">
+        <span class="tag-label">快速体验：</span>
+        <button class="tag" data-query="北京3日游，2人，预算4000元，喜欢历史文化">&#x1F3DB; 北京3日游</button>
+        <button class="tag" data-query="云南亲子游8天，一家三口，预算12000元，喜欢自然风光">&#x1F33F; 云南亲子游</button>
+        <button class="tag" data-query="日本赏樱7天，2人，预算20000元，喜欢美食和樱花">&#x1F338; 日本赏樱7天</button>
+        <button class="tag" data-query="成都美食之旅4天，1人，预算3000元，纯吃纯玩">&#x1F959; 成都美食之旅</button>
+      </div>
+
+      <div class="status-bar" id="status-bar">
+        <span class="status-dot" id="status-dot"></span>
+        <span id="status-text">检测 API 配置中...</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 生成中状态 -->
+  <section class="generating-section" id="generating-section" style="display:none">
+    <div class="generating-header">
+      <div class="pulse-dot"></div>
+      <h3>AI 正在为您规划行程...</h3>
+      <button class="btn btn-sm btn-outline" id="btn-cancel">取消</button>
+    </div>
+    <div class="stream-output" id="stream-output">
+      <div class="stream-cursor"></div>
+    </div>
+  </section>
+
+  <!-- 完成状态：攻略展示 -->
+  <section class="result-section" id="result-section" style="display:none">
+    <div class="result-toolbar">
+      <div class="toolbar-left">
+        <span class="result-badge">&#x2705; 攻略已生成</span>
+        <span class="guide-id" id="guide-id-label"></span>
+      </div>
+      <div class="toolbar-right">
+        <button class="btn btn-sm btn-outline" id="btn-download-html">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          HTML
+        </button>
+        <button class="btn btn-sm btn-primary" id="btn-download-pdf">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          PDF 下载
+        </button>
+        <button class="btn btn-sm btn-primary" id="btn-download-docx">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          DOCX 下载
+        </button>
+        <button class="btn btn-sm btn-primary" id="btn-save-trip">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/></svg>
+          保存行程
+        </button>
+        <button class="btn btn-sm btn-outline" id="btn-regenerate">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+          重新生成
+        </button>
+      </div>
+    </div>
+    <div class="guide-preview" id="guide-preview"></div>
+  </section>
+
+  <!-- 我的行程 -->
+  <section class="trips-section" id="trips-section" style="display:none">
+    <div class="trips-header">
+      <h2>我的行程</h2>
+      <button class="btn btn-sm btn-outline" id="btn-refresh-trips">刷新</button>
+    </div>
+    <div class="trips-list" id="trips-list">
+      <p class="empty-hint">暂无保存的行程，生成攻略后可保存</p>
+    </div>
+  </section>
+
+</main>
+
+<!-- ====== Toast 通知 ====== -->
+<div class="toast-container" id="toast-container"></div>
+
+<!-- ====== Footer ====== -->
+<footer class="app-footer">
+  <p>AI 旅行攻略生成器 · 攻略内容由 AI 生成，具体价格和营业时间请以实际为准</p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

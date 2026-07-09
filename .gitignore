@@ -1,0 +1,26 @@
+# 环境变量 / 密钥
+.env
+.env.*
+!.env.example
+
+# Python 虚拟环境与缓存
+.venv/
+__pycache__/
+*.pyc
+
+# SQLite 数据库
+*.db
+*.db-wal
+*.db-shm
+
+# macOS
+.DS_Store
+
+# vim 交换文件
+*.swp
+
+# 运行时缓存（含 12306 会话 cookie 等凭据，属敏感数据，且可自动重建）
+services/cache/
+
+# 生成的临时预览文件
+generated-guide-preview.html
