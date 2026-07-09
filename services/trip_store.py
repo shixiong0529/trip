@@ -197,26 +197,37 @@ def parse_trip_fields(raw_text: str, markdown: str = "") -> dict:
     combined = f"{heading}\n{markdown}\n{raw_text}"
 
     days = None
-    m = re.search(r"(\d+)\s*[日天]", combined)
+    # 排除日期写法（"7月9日"）：数字前是"月"的不算天数；同时限定合理区间
+    m = re.search(r"(?<!月)(\d{1,2})\s*[日天]", combined)
     if m:
         try:
-            days = int(m.group(1))
+            candidate = int(m.group(1))
+            if 1 <= candidate <= 90:
+                days = candidate
         except ValueError:
             days = None
 
     travelers = None
-    m = re.search(r"(\d+)\s*人", combined)
+    m = re.search(r"(\d{1,2})\s*(?:个)?人", combined)
     if m:
         try:
-            travelers = int(m.group(1))
+            candidate = int(m.group(1))
+            if 1 <= candidate <= 50:
+                travelers = candidate
         except ValueError:
             travelers = None
 
     budget = None
-    m = re.search(r"预算\s*¥?\s*([\d,]+)", combined)
+    # 支持 "预算15000"、"预算 ¥15,000"、"预算1.5万"、"预算2千" 等写法
+    m = re.search(r"预算\s*[¥￥]?\s*([\d,]+(?:\.\d+)?)\s*([万千wWkK])?", combined)
     if m:
         try:
             budget = float(m.group(1).replace(",", ""))
+            unit = m.group(2) or ""
+            if unit in ("万", "w", "W"):
+                budget *= 10000
+            elif unit in ("千", "k", "K"):
+                budget *= 1000
         except ValueError:
             budget = None
 
