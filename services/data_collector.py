@@ -98,7 +98,9 @@ async def _query_train_reference(org: str, dest: str) -> str:
     """
     from services.train_service import query_tickets, format_ticket_result
 
-    ref_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    # 12306 是国内服务，参考日期固定按中国时区算，避免部署在 UTC 服务器时差一天
+    from zoneinfo import ZoneInfo
+    ref_date = (datetime.now(ZoneInfo("Asia/Shanghai")) + timedelta(days=7)).strftime("%Y-%m-%d")
     try:
         result = await asyncio.to_thread(query_tickets, org, dest, ref_date)
         if not isinstance(result, dict) or result.get("error"):

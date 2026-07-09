@@ -5,7 +5,6 @@ FastAPI 应用主入口
 - SSE 流式响应
 """
 
-import re
 import uuid
 import asyncio
 from pathlib import Path
@@ -41,9 +40,10 @@ app.add_middleware(
 # ---------- 攻略缓存（SQLite 持久化，见 services/trip_store.py） ----------
 
 def _clean_cache():
-    """清理过期缓存"""
+    """清理过期缓存（攻略 + 携程问道查询缓存）"""
     from services import trip_store
     trip_store.clean_expired_guides(app_config.guide_cache_ttl)
+    trip_store.clean_expired_wendao_cache(app_config.wendao_cache_ttl)
 
 
 # ---------- 健康检查 ----------
@@ -261,12 +261,13 @@ async def delete_trip(trip_id: str):
     raise HTTPException(status_code=404, detail="行程不存在")
 
 
-_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-
-
 def _validate_date(date: str) -> None:
-    if not _DATE_RE.match(date):
-        raise HTTPException(status_code=400, detail="date 格式应为 YYYY-MM-DD")
+    """严格校验日期：格式 + 语义（2026-13-99 之类拒绝），strptime 顺带杜绝尾部换行"""
+    from datetime import datetime
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date 格式应为 YYYY-MM-DD 的有效日期")
 
 
 # ---------- 12306 火车票查询 ----------

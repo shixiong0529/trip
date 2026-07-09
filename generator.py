@@ -266,22 +266,22 @@ def _render_hero(title: str) -> str:
 
 def _render_overview(paras: list[str]) -> str:
     """渲染概览区：统计卡片 + 路线总览 + 重要提示"""
-    html = '<div class="stats-grid">\n'
+    html = ""
 
-    # 从第一段提取关键统计数字
+    # 从第一段提取关键统计数字；提取到 ≥2 项才视为"统计段"，
+    # 否则按普通段落输出，避免 H1 后的正文段落被静默丢弃
     stats = _extract_stats(paras[0]) if paras else []
-    if not stats:
-        stats = [
-            ("旅行天数", "—"),
-            ("人均预算", "—"),
-        ]
-
-    for label, value in stats:
-        html += f'  <div class="stat-card"><div class="stat-value">{value}</div><div class="stat-label">{label}</div></div>\n'
-    html += '</div>\n'
+    rest = paras[1:]
+    if len(stats) >= 2:
+        html += '<div class="stats-grid">\n'
+        for label, value in stats:
+            html += f'  <div class="stat-card"><div class="stat-value">{value}</div><div class="stat-label">{label}</div></div>\n'
+        html += '</div>\n'
+    else:
+        rest = paras
 
     # 路线总览 + 重要提示用 card 包裹
-    for p in paras[1:]:
+    for p in rest:
         html += f'<div class="card"><p>{_inline_md(p)}</p></div>\n'
 
     return html
