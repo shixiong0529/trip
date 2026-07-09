@@ -33,13 +33,6 @@
     statusBar: $('#status-bar'),
     statusDot: $('#status-dot'),
     statusText: $('#status-text'),
-    settingsOverlay: $('#settings-overlay'),
-    btnSettings: $('#btn-settings'),
-    btnCloseSettings: $('#btn-close-settings'),
-    btnSaveConfig: $('#btn-save-config'),
-    cfgBaseUrl: $('#cfg-base-url'),
-    cfgApiKey: $('#cfg-api-key'),
-    cfgModel: $('#cfg-model'),
     toastContainer: $('#toast-container'),
   };
 
@@ -59,7 +52,7 @@
     },
   };
 
-  // ====== 配置管理 ======
+  // ====== 配置管理（配置 UI 已移除，仍兼容读取历史保存的浏览器端配置） ======
   function loadConfig() {
     try {
       const saved = localStorage.getItem('travel_guide_config');
@@ -67,19 +60,6 @@
         state.config = { ...state.config, ...JSON.parse(saved) };
       }
     } catch (e) { /* ignore */ }
-    els.cfgBaseUrl.value = state.config.base_url || '';
-    els.cfgApiKey.value = state.config.api_key || '';
-    els.cfgModel.value = state.config.model || '';
-  }
-
-  function saveConfig() {
-    state.config.base_url = els.cfgBaseUrl.value.trim();
-    state.config.api_key = els.cfgApiKey.value.trim();
-    state.config.model = els.cfgModel.value.trim();
-    localStorage.setItem('travel_guide_config', JSON.stringify(state.config));
-    els.settingsOverlay.classList.remove('active');
-    showToast('配置已保存', 'success');
-    checkHealth();
   }
 
   // ====== 健康检查 ======
@@ -101,7 +81,7 @@
           : 'LLM 已配置（浏览器 API Key）';
       } else {
         els.statusDot.className = 'status-dot disconnected';
-        els.statusText.textContent = '未配置 API Key，点击此处设置';
+        els.statusText.textContent = '未配置 API Key，请在服务端 .env 中设置 LLM_API_KEY';
       }
     } catch (e) {
       els.statusDot.className = 'status-dot error';
@@ -351,19 +331,6 @@
     });
   });
 
-  els.btnSettings.addEventListener('click', function() {
-    els.settingsOverlay.classList.add('active');
-  });
-  els.btnCloseSettings.addEventListener('click', function() {
-    els.settingsOverlay.classList.remove('active');
-  });
-  els.settingsOverlay.addEventListener('click', function(e) {
-    if (e.target === els.settingsOverlay) {
-      els.settingsOverlay.classList.remove('active');
-    }
-  });
-  els.btnSaveConfig.addEventListener('click', saveConfig);
-
   els.btnSaveTrip.addEventListener('click', saveTrip);
 
   // ====== Tab 切换 ======
@@ -469,11 +436,10 @@
     checkHealth();
     setMode('idle');
 
+    // 点击状态条重新检测服务状态
     els.statusBar.style.cursor = 'pointer';
-    els.statusBar.title = '点击设置 API Key';
-    els.statusBar.addEventListener('click', function() {
-      els.settingsOverlay.classList.add('active');
-    });
+    els.statusBar.title = '点击重新检测服务状态';
+    els.statusBar.addEventListener('click', checkHealth);
   }
 
   init();
