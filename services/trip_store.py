@@ -9,6 +9,7 @@
   packing_lists: 打包清单模板
 """
 
+import os
 import re
 import sqlite3
 import json
@@ -18,7 +19,10 @@ from typing import Optional
 from pathlib import Path
 
 
-DB_PATH = Path(__file__).parent.parent / "travel_data.db"
+# 支持通过环境变量 TRIP_STORE_DB_PATH 覆盖数据库路径（测试环境用，避免污染真实数据库）。
+# 未设置时保持原有行为：项目根目录下的 travel_data.db。
+DB_PATH = Path(os.environ["TRIP_STORE_DB_PATH"]) if os.environ.get("TRIP_STORE_DB_PATH") \
+    else Path(__file__).parent.parent / "travel_data.db"
 
 
 def _get_db() -> sqlite3.Connection:

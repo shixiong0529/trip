@@ -106,13 +106,18 @@ def _parse_markdown_to_blocks(md: str) -> list[dict]:
             blocks.append({"type": "tasks", "items": task_items})
             continue
 
-        # 无序列表 - xxx 或 * xxx
+        # 无序列表 - xxx 或 * xxx（支持两级嵌套：缩进 >=2 空格的子项挂到上一个顶层项下）
         if re.match(r"^[\s]*[-*]\s+", line):
             list_items = []
             while i < len(lines) and re.match(r"^[\s]*[-*]\s+", lines[i]) \
                     and not re.match(r"^[\s]*[-*]\s+\[[ x]\]", lines[i]):
-                item_text = re.sub(r"^[\s]*[-*]\s+", "", lines[i])
-                list_items.append(item_text)
+                m_item = re.match(r"^(\s*)[-*]\s+(.*)", lines[i])
+                indent = len(m_item.group(1))
+                item_text = m_item.group(2)
+                if indent >= 2 and list_items:
+                    list_items[-1]["children"].append(item_text)
+                else:
+                    list_items.append({"text": item_text, "children": []})
                 i += 1
             blocks.append({"type": "ul", "items": list_items})
             continue
@@ -217,9 +222,16 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
         elif t == "table":
             html += _render_table(block["rows"])
 
-        # 列表
+        # 列表（支持两级嵌套）
         elif t == "ul":
-            items = "".join(f"<li>{_inline_md(it)}</li>" for it in block["items"])
+            items = ""
+            for it in block["items"]:
+                items += f"<li>{_inline_md(it['text'])}"
+                children = it.get("children") or []
+                if children:
+                    child_html = "".join(f"<li>{_inline_md(c)}</li>" for c in children)
+                    items += f"<ul>{child_html}</ul>"
+                items += "</li>"
             html += f"<div class=\"card\"><ul>{items}</ul></div>\n"
 
         elif t == "ol":
@@ -534,9 +546,16 @@ class TravelGuideGenerator:
             run = p.runs[0] if p.runs else p.add_run(text)
             run.font.italic = True
             run.font.color.rgb = RGBColor(100, 116, 139)
-        elif t in ("ul", "ol"):
+        elif t == "ul":
             for item in block.get("items", []):
-                p = doc.add_paragraph(style="List Bullet" if t == "ul" else "List Number")
+                p = doc.add_paragraph(style="List Bullet")
+                _add_md_runs(p, item["text"])
+                for child in item.get("children") or []:
+                    cp = doc.add_paragraph(style="List Bullet 2")
+                    _add_md_runs(cp, child)
+        elif t == "ol":
+            for item in block.get("items", []):
+                p = doc.add_paragraph(style="List Number")
                 _add_md_runs(p, item)
         elif t == "tasks":
             for item in block.get("items", []):

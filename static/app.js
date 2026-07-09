@@ -272,6 +272,7 @@
 
     els.guidePreview.innerHTML = '';
     var iframe = document.createElement('iframe');
+    iframe.setAttribute('sandbox', 'allow-same-origin');
     iframe.srcdoc = state.guideHtml;
     iframe.style.width = '100%';
     iframe.style.border = 'none';

@@ -124,3 +124,37 @@ trip/
 │   └── html-report-design-system.md ← 设计参考
 └── travel_data.db            ← SQLite 数据库（运行时生成）
 ```
+
+## 2026-07-09 三阶段改进
+
+### 阶段一（首次提交）
+- 项目纳入 git 版本管理，`.env`/`*.db` 等敏感与运行时产物纳入 `.gitignore`
+- 密钥/连接器相关文案统一（携程问道 Token 通过 `WENDAO_API_KEY` 注入）
+- 攻略缓存从内存迁移到 SQLite（`guides` 表），服务重启不丢失
+- 新增行程解析与查看能力（`parse_trip_fields` + `/api/trips/{id}/view`）
+
+### 阶段二（12306/机票接入 + 问道缓存 + 截断续写）
+- 接入 12306 余票查询（`services/train_service.py`）与国际机票查询（`services/flight_search.py`，基于 fast-flights）
+- `data_collector.py` 并行采集时一并发起 12306 查询作为交通数据补充参考
+- 新增携程问道查询结果缓存（`wendao_cache` 表，按 query 的 sha256 做 key，TTL 默认 12 小时），降低每日配额消耗
+- LLM 输出被截断（`finish_reason == "length"`）时自动发起续写一轮，避免攻略戛然而止
+- `/api/health` 新增 `pdf_ready` 字段，探测 WeasyPrint 系统依赖是否就绪
+
+### 阶段三（本次：generator 嵌套列表 + 测试 + 前端清理 + CORS 收紧）
+- `generator.py` 的 Markdown 解析支持两级无序列表嵌套（缩进 ≥2 空格的 `- ` 挂载为上一项子项），HTML 输出为嵌套 `<ul>`，DOCX 子项使用内置 `List Bullet 2` 样式
+- 新增 `tests/` pytest 测试套件（generator / trip_store / data_collector / API / prompts），测试库通过 monkeypatch 隔离到临时目录，不污染 `travel_data.db`，不触网
+- 前端清理：移除生成按钮从未被使用过的 `.btn-text`/`.btn-loading`/`.spinner` 死代码；攻略预览 iframe 补充 `sandbox="allow-same-origin"`（不含 `allow-scripts`，攻略 HTML 本身无脚本，仅保留同源读取 `contentDocument` 以计算高度所需的权限）
+- 删除过期产物 `generated-guide-preview.html`
+- CORS 收紧：`allow_origins=["*"]` + `allow_credentials=True` 属违规组合（浏览器会拒绝携带凭据的通配符跨域响应，且存在安全隐患），改为 `AppConfig.allowed_origins`，默认仅允许 `http://localhost:{PORT}` / `http://127.0.0.1:{PORT}`，可通过环境变量 `ALLOWED_ORIGINS`（逗号分隔）覆盖
+
+## 架构决策记录
+
+### 自研 Markdown 解析器：保留，不更换为第三方库
+- **决策**：`generator.py` 中的 `_parse_markdown_to_blocks` / `_blocks_to_html_fragment` 继续自研维护，不迁移到 `markdown-it-py` 等第三方库
+- **理由**：
+  1. 深度定制的渲染路径（day-card 日程卡片、hero 区、stats-grid 统计卡片、badge 徽章、tree 知识图谱树）与业务语义强绑定，通用 Markdown 库不原生支持，仍需大量自定义插件/后处理，收益有限
+  2. 当前行为已被阶段三新增的 pytest 测试套件锁定（任务列表、表格、嵌套列表、H1 后普通段落保留、emoji 图标去重等边界情况均有回归测试覆盖），换库的收益小、破坏现有细节渲染的风险大
+- **已知限制**：
+  - 携程问道 API 每 token 每日配额 30 次调用，已通过 `wendao_cache` 表做 12 小时缓存缓解，但短时间内大量不同查询仍可能触发配额上限
+  - 12306 查询存在风控机制，高频调用可能触发验证码/封禁，`train_service.py` 仅做查票不做下单以降低风险
+  - 国际机票查询依赖 `fast-flights` 库抓取 Google Flights 数据，上游页面结构变化或反爬策略调整时可能失效，且依赖 `uvx` 环境

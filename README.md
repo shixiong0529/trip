@@ -75,6 +75,10 @@ apt install libpango-1.0-0 libcairo2 libgobject-2.0-0
 
 如果系统库不可用，PDF 功能会禁用，HTML 和 DOCX 不受影响。
 
+### 部署与 CORS
+
+跨域部署（前端与后端不同源，如反向代理/CDN 分离场景）时，需通过环境变量 `ALLOWED_ORIGINS` 显式声明允许的来源（逗号分隔，如 `ALLOWED_ORIGINS=https://your-domain.com,https://admin.your-domain.com`）；未配置时默认仅允许 `http://localhost:{PORT}` 和 `http://127.0.0.1:{PORT}` 访问，本地同源前端不受影响。
+
 ## API
 
 | 接口 | 说明 |
