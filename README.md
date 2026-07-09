@@ -89,6 +89,8 @@ apt install libpango-1.0-0 libcairo2 libgobject-2.0-0
 | `DELETE /api/trips/{id}` | 删除行程 |
 | `GET /api/flight/track` | 航班实时追踪（OpenSky） |
 | `GET /api/weather/aviation` | 航空气象 METAR/TAF |
+| `GET /api/train/tickets` | 12306 余票查询，`?from_station&to_station&date` |
+| `GET /api/flights/search` | 国际机票查询（Google Flights），`?origin&destination&date&nonstop&passengers` |
 
 ## 架构
 

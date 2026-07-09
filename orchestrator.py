@@ -2,6 +2,10 @@
 AI 编排层 v2.0
 两阶段生成：实时数据采集 → LLM 生成攻略
 集成携程问道、12306、Google Flights、OpenSky、航空气象
+
+除两阶段编排外，app.py 还暴露两个独立查询端点（不经过 LLM，直接返回原始数据）：
+  GET /api/train/tickets   — 12306 余票查询（?from_station&to_station&date）
+  GET /api/flights/search  — 国际机票查询，Google Flights（?origin&destination&date&nonstop&passengers）
 """
 
 import json
@@ -24,6 +28,7 @@ class LLMClient:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.last_finish_reason = None
 
     @property
     def chat_url(self) -> str:
@@ -42,7 +47,12 @@ class LLMClient:
         }
 
     async def chat_stream(self, messages: list[dict]) -> AsyncGenerator[str, None]:
-        """流式调用 LLM"""
+        """流式调用 LLM
+
+        流开始时重置 self.last_finish_reason，流结束后该属性保存最后一个
+        非空的 finish_reason（如 "stop"/"length"），供调用方判断是否被截断。
+        """
+        self.last_finish_reason = None
         payload = self._build_payload(messages, stream=True)
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -75,6 +85,9 @@ class LLMClient:
                                     content = delta.get("content", "")
                                     if content:
                                         yield content
+                                    finish_reason = choices[0].get("finish_reason")
+                                    if finish_reason:
+                                        self.last_finish_reason = finish_reason
                             except json.JSONDecodeError:
                                 continue
             except httpx.ConnectError:
@@ -127,8 +140,10 @@ class TravelGuideOrchestrator:
         try:
             first_chunk = True
             buffer = ""
+            full_content = ""
             async for content in self.llm.chat_stream(messages):
                 buffer += content
+                full_content += content
                 if first_chunk:
                     yield {"type": "progress", "data": "AI 正在生成详细攻略..."}
                     first_chunk = False
@@ -139,6 +154,26 @@ class TravelGuideOrchestrator:
             # 发送剩余缓冲
             if buffer:
                 yield {"type": "content", "data": buffer}
+
+            # 输出被截断（finish_reason == "length"）时自动续写一轮，避免攻略戛然而止
+            if self.llm.last_finish_reason == "length":
+                yield {"type": "progress", "data": "输出较长，正在自动续写..."}
+                continue_messages = messages + [
+                    {"role": "assistant", "content": full_content},
+                    {
+                        "role": "user",
+                        "content": "继续输出剩余内容，从中断处无缝续写，不要重复任何已输出内容，不要加任何过渡语。",
+                    },
+                ]
+                buffer = ""
+                async for content in self.llm.chat_stream(continue_messages):
+                    buffer += content
+                    if len(buffer) >= 200 or "\n" in buffer:
+                        yield {"type": "content", "data": buffer}
+                        buffer = ""
+                if buffer:
+                    yield {"type": "content", "data": buffer}
+                # 续写轮 finish_reason 仍为 "length" 也不再继续（最多续写 1 轮）
 
             yield {"type": "progress", "data": "正在生成精美文档..."}
 

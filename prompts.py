@@ -223,12 +223,15 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
     hotels = travel_data.get("hotels", "")
     attractions = travel_data.get("attractions", "")
     tips = travel_data.get("tips", "")
+    train = travel_data.get("train", "")
 
     data_context = ""
-    if any([transport, hotels, attractions, tips]):
+    if any([transport, hotels, attractions, tips, train]):
         data_context = "\n\n--- 携程问道实时查询的真实数据，请直接引用其中的具体数字 ---\n"
         if transport:
             data_context += f"\n【真实交通数据】\n{transport}\n"
+        if train:
+            data_context += f"\n【真实火车票数据】\n{train}\n"
         if hotels:
             data_context += f"\n【真实酒店数据】\n{hotels}\n"
         if attractions:

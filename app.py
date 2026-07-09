@@ -5,6 +5,7 @@ FastAPI 应用主入口
 - SSE 流式响应
 """
 
+import re
 import uuid
 import asyncio
 from pathlib import Path
@@ -49,12 +50,14 @@ def _clean_cache():
 @app.get("/api/health")
 async def health_check():
     import os
+    from generator import _weasyprint_available
     ctrip_ready = bool(os.getenv("WENDAO_API_KEY", "").strip())
     return {
         "status": "ok",
         "llm_configured": llm_config.is_configured,
         "model": llm_config.model,
         "ctrip_ready": ctrip_ready,
+        "pdf_ready": _weasyprint_available,
     }
 
 
@@ -256,6 +259,53 @@ async def delete_trip(trip_id: str):
     if trip_store.delete_trip(trip_id):
         return {"status": "deleted"}
     raise HTTPException(status_code=404, detail="行程不存在")
+
+
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _validate_date(date: str) -> None:
+    if not _DATE_RE.match(date):
+        raise HTTPException(status_code=400, detail="date 格式应为 YYYY-MM-DD")
+
+
+# ---------- 12306 火车票查询 ----------
+@app.get("/api/train/tickets")
+async def train_tickets(
+    from_station: str = Query(""),
+    to_station: str = Query(""),
+    date: str = Query(""),
+):
+    """12306 余票查询"""
+    if not from_station.strip() or not to_station.strip() or not date.strip():
+        raise HTTPException(status_code=400, detail="from_station、to_station、date 均为必填参数")
+    _validate_date(date)
+
+    from services import train_service
+    result = await asyncio.to_thread(train_service.query_tickets, from_station, to_station, date)
+    text = await asyncio.to_thread(train_service.format_ticket_result, result)
+    return {"data": text}
+
+
+# ---------- 国际机票查询 ----------
+@app.get("/api/flights/search")
+async def flights_search(
+    origin: str = Query(""),
+    destination: str = Query(""),
+    date: str = Query(""),
+    nonstop: bool = Query(False),
+    passengers: int = Query(1),
+):
+    """国际机票查询（Google Flights，经 fast-flights）"""
+    if not origin.strip() or not destination.strip() or not date.strip():
+        raise HTTPException(status_code=400, detail="origin、destination、date 均为必填参数")
+    _validate_date(date)
+
+    from services import flight_search
+    text = await asyncio.to_thread(
+        flight_search.search_flights, origin, destination, date, nonstop, passengers
+    )
+    return {"data": text}
 
 
 # ---------- 实时服务 API ----------

@@ -93,6 +93,13 @@ def init_db():
             markdown TEXT DEFAULT '',
             created_at REAL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS wendao_cache (
+            query_hash TEXT PRIMARY KEY,
+            query TEXT DEFAULT '',
+            result TEXT DEFAULT '',
+            created_at REAL DEFAULT 0
+        );
     """)
     conn.commit()
 
@@ -282,6 +289,42 @@ def clean_expired_guides(ttl_seconds: int) -> None:
     conn = _get_db()
     conn.execute(
         "DELETE FROM guides WHERE (? - created_at) > ?",
+        (time.time(), ttl_seconds),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- 携程问道查询缓存 ----------
+
+def get_cached_wendao(query_hash: str) -> Optional[dict]:
+    """按 query_hash 读取缓存记录（不做过期判断，由调用方结合 TTL 处理）"""
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM wendao_cache WHERE query_hash = ?", (query_hash,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_wendao_cache(query_hash: str, query: str, result: str) -> None:
+    """写入/更新携程问道查询缓存"""
+    now = time.time()
+    conn = _get_db()
+    conn.execute("""
+        INSERT INTO wendao_cache (query_hash, query, result, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(query_hash) DO UPDATE SET query = ?, result = ?, created_at = ?
+    """, (query_hash, query, result, now, query, result, now))
+    conn.commit()
+    conn.close()
+
+
+def clean_expired_wendao_cache(ttl_seconds: int) -> None:
+    """清理过期的携程问道查询缓存"""
+    conn = _get_db()
+    conn.execute(
+        "DELETE FROM wendao_cache WHERE (? - created_at) > ?",
         (time.time(), ttl_seconds),
     )
     conn.commit()

@@ -5,6 +5,7 @@
 
 import asyncio
 import re
+from datetime import datetime, timedelta
 from typing import Optional
 from services.ctrip_client import get_ctrip_client
 
@@ -22,10 +23,11 @@ async def collect_travel_data(
 
     Returns:
         {
-            "transport": str,      # 机票/火车票 Markdown
+            "transport": str,      # 机票/火车票 Markdown（携程问道）
             "hotels": str,         # 酒店推荐 Markdown
             "attractions": str,    # 景点门票 Markdown
             "tips": str,           # 实用贴士 Markdown
+            "train": str,          # 12306 真实余票参考（origin/destination 均提取成功时才有）
         }
     """
     client = get_ctrip_client()
@@ -59,9 +61,18 @@ async def collect_travel_data(
     tasks.append(("attractions", attraction_query))
     tasks.append(("tips", tips_query))
 
-    # 并行执行
+    # 并行执行：携程问道四路查询 + 12306 火车票查询（若能提取出发地/目的地）一起并行，
+    # 避免火车票查询把总耗时变成串行相加
     labels, queries = zip(*tasks)
-    results = await client.query_many(list(queries))
+    query_many_coro = client.query_many(list(queries))
+
+    train_coro = _query_train_reference(org, dest) if (org and dest) else None
+
+    if train_coro is not None:
+        results, train_result = await asyncio.gather(query_many_coro, train_coro)
+    else:
+        results = await query_many_coro
+        train_result = ""
 
     # 聚合结果
     data = {}
@@ -74,7 +85,30 @@ async def collect_travel_data(
         else:
             data[label] = str(result)
 
+    data["train"] = train_result
+
     return data
+
+
+async def _query_train_reference(org: str, dest: str) -> str:
+    """并行调用 12306 查询真实余票，作为交通数据的补充参考。
+
+    参考日期取今天 + 7 天。查询失败（error dict / 异常）时返回空串，不抛出，
+    避免阻塞其余四路携程问道查询。
+    """
+    from services.train_service import query_tickets, format_ticket_result
+
+    ref_date = (datetime.now() + timedelta(days=7)).strftime("%Y-%m-%d")
+    try:
+        result = await asyncio.to_thread(query_tickets, org, dest, ref_date)
+        if not isinstance(result, dict) or result.get("error"):
+            return ""
+        text = format_ticket_result(result)
+        if not text:
+            return ""
+        return f"（以下为 {ref_date} 的12306余票参考，仅供交通规划参考）\n{text}"
+    except Exception:
+        return ""
 
 
 def _extract_destination(query: str) -> Optional[str]:

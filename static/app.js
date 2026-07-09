@@ -51,6 +51,7 @@
     guideMarkdown: null,
     progressSteps: [],
     abortController: null,
+    pdfReady: true,      // 由 /api/health 的 pdf_ready 更新，决定 PDF 下载按钮是否可用
     config: {
       base_url: '',
       api_key: '',
@@ -90,6 +91,9 @@
       const hasLocalKey = !!state.config.api_key;
       const hasKey = hasServerKey || hasLocalKey;
 
+      state.pdfReady = data.pdf_ready !== false;
+      updatePdfButtonState();
+
       if (hasKey) {
         els.statusDot.className = 'status-dot connected';
         els.statusText.textContent = hasServerKey
@@ -105,6 +109,18 @@
     }
   }
 
+  // ====== PDF 可用性 ======
+  function updatePdfButtonState() {
+    if (!els.btnDownloadPdf) return;
+    if (state.pdfReady === false) {
+      els.btnDownloadPdf.disabled = true;
+      els.btnDownloadPdf.title = 'PDF 需要安装系统依赖（brew install pango cairo glib）';
+    } else {
+      els.btnDownloadPdf.disabled = false;
+      els.btnDownloadPdf.title = '';
+    }
+  }
+
   // ====== 模式切换 ======
   function setMode(mode) {
     state.mode = mode;
@@ -112,6 +128,9 @@
     els.generatingSection.style.display = mode === 'generating' ? 'block' : 'none';
     els.resultSection.style.display = mode === 'done' ? 'block' : 'none';
     els.tripsSection.style.display = 'none';
+    if (mode === 'done') {
+      updatePdfButtonState();
+    }
   }
 
   // ====== Toast 通知 ======
@@ -314,7 +333,13 @@
   });
 
   els.btnDownloadHtml.addEventListener('click', function() { downloadGuide('html'); });
-  els.btnDownloadPdf.addEventListener('click', function() { downloadGuide('pdf'); });
+  els.btnDownloadPdf.addEventListener('click', function() {
+    if (state.pdfReady === false) {
+      showToast('PDF 需要安装系统依赖（brew install pango cairo glib）', 'error');
+      return;
+    }
+    downloadGuide('pdf');
+  });
   els.btnDownloadDocx.addEventListener('click', function() { downloadGuide('docx'); });
 
   $$('.tag').forEach(function(tag) {

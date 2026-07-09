@@ -33,6 +33,7 @@ class AppConfig:
         self.static_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
         self.templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
         self.guide_cache_ttl = int(os.getenv("GUIDE_CACHE_TTL", "86400"))  # 攻略缓存有效期（秒），默认 24 小时
+        self.wendao_cache_ttl = int(os.getenv("WENDAO_CACHE_TTL", "43200"))  # 携程问道查询缓存有效期（秒），默认 12 小时
 
 
 llm_config = LLMConfig()
