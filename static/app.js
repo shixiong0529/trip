@@ -130,6 +130,21 @@
     }, 3000);
   }
 
+  function scrollPageToTop() {
+    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+      document.activeElement.blur();
+    }
+
+    function scrollNow() {
+      window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+      document.documentElement.scrollTop = 0;
+      document.body.scrollTop = 0;
+    }
+
+    requestAnimationFrame(scrollNow);
+    setTimeout(scrollNow, 80);
+  }
+
   // ====== 生成攻略 ======
   async function startGeneration() {
     const query = els.queryInput.value.trim();
@@ -139,6 +154,7 @@
     }
 
     setMode('generating');
+    scrollPageToTop();
     els.streamOutput.textContent = '';
     state.guideMarkdown = null;
     state.guideHtml = null;
