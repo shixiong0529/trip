@@ -257,11 +257,11 @@
     els.guidePreview.innerHTML = '';
     var iframe = document.createElement('iframe');
     iframe.setAttribute('sandbox', 'allow-same-origin');
-    iframe.srcdoc = state.guideHtml;
     iframe.style.width = '100%';
     iframe.style.border = 'none';
     iframe.style.minHeight = '800px';
-    iframe.onload = function() {
+
+    function fitHeight() {
       try {
         var d = iframe.contentDocument;
         var height = Math.max(
@@ -274,7 +274,20 @@
       } catch (e) {
         iframe.style.height = '2000px';
       }
+    }
+    iframe.onload = function() {
+      fitHeight();
+      // 移动端 base64 图片/字体常在 onload 后才完成排版，延时再量一次
+      setTimeout(fitHeight, 500);
     };
+
+    // 攻略 HTML 体积很大（内联底图可达数百 KB），srcdoc 在 iOS/微信 WKWebView 下会渲染空白，
+    // 改为直接加载同源的服务端渲染地址，兼容性最好
+    if (state.guideId) {
+      iframe.src = '/api/download/' + encodeURIComponent(state.guideId) + '?format=html';
+    } else {
+      iframe.srcdoc = state.guideHtml || '';
+    }
     els.guidePreview.appendChild(iframe);
 
     els.resultSection.scrollIntoView({ behavior: 'smooth' });
