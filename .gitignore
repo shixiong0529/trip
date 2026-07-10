@@ -24,3 +24,9 @@ services/cache/
 
 # 生成的临时预览文件
 generated-guide-preview.html
+generated-guide-preview.md
+
+# 设计过程产物（正式使用的 logo 在 static/logo-nav.png）
+/log*.png
+/logo*.png
+static/logo1-report.png
