@@ -12,7 +12,8 @@ def test_homepage_uses_clear_background_and_note_footer():
     assert "AI AGENT · 实时数据 · 三格式导出" not in index
     assert "AI AGENT · 实时数据" in index
     assert "告诉我目的地、天数和旅行偏好，AI 结合实时数据，帮你规划一份可以直接照着走的行程" in index
-    assert "NOTA BENE" in index
+    # 页脚免责说明（NOTA BENE 标语已在后续改版中移除）
+    assert "本工具基于人工智能与互联网检索生成参考方案" in index
     assert "数据来源" in index
     assert "隐私政策" in index
     assert "服务条款" in index
@@ -49,7 +50,7 @@ def test_homepage_uses_logo_image_as_nav_icon_only():
     css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
 
     assert 'class="homepage-logo"' not in index
-    assert 'src="/static/logo-nav.png"' in index
+    assert 'src="/static/logo_good.png"' in index
     assert "&#x2708;" not in index
     logo_rule = re.search(r"\.logo-icon\s*\{(?P<body>.*?)\}", css, re.S)
     assert logo_rule is not None
