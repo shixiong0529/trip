@@ -148,9 +148,27 @@ def _build_detail_map(key: str, resolved: list[dict[str, str]], route_points: li
 
 
 def extract_route_nodes(markdown_content: str) -> list[str]:
-    """从分日行程表中提取加粗地点名，按出现顺序去重。"""
+    """从路线总览和分日行程表中提取地点名，按出现顺序去重。
+
+    LLM 输出并不稳定：有时地点用 **加粗**，有时用「书名号」，
+    有时只集中写在"路线总览"里。这里兼容三种形态。
+    """
     nodes: list[str] = []
     seen = set()
+
+    def add_node(raw_name: str) -> None:
+        name = _clean_node_name(raw_name)
+        if not _looks_like_place(name):
+            return
+        if name not in seen:
+            seen.add(name)
+            nodes.append(name)
+
+    for name in _extract_route_overview_nodes(markdown_content):
+        add_node(name)
+        if len(nodes) >= MAX_ROUTE_NODES:
+            return nodes
+
     in_day_section = False
 
     for line in markdown_content.splitlines():
@@ -163,16 +181,43 @@ def extract_route_nodes(markdown_content: str) -> list[str]:
             continue
 
         for match in re.finditer(r"\*\*([^*\n]{2,30})\*\*", line):
-            name = _clean_node_name(match.group(1))
-            if not _looks_like_place(name):
-                continue
-            if name not in seen:
-                seen.add(name)
-                nodes.append(name)
+            add_node(match.group(1))
+            if len(nodes) >= MAX_ROUTE_NODES:
+                return nodes
+
+        for name in _extract_quoted_place_nodes(line):
+            add_node(name)
             if len(nodes) >= MAX_ROUTE_NODES:
                 return nodes
 
     return nodes
+
+
+def _extract_route_overview_nodes(markdown_content: str) -> list[str]:
+    nodes: list[str] = []
+    for line in markdown_content.splitlines():
+        if "路线总览" not in line:
+            continue
+        text = re.sub(r"^\s*[-+]\s*", "", line)
+        text = re.sub(r"\*\*路线总览\*\*\s*[:：]?", "", text)
+        text = re.sub(r"路线总览\s*[:：]?", "", text)
+        parts = re.split(r"(?:→|->|⇒|➡️|➡)", text)
+        for part in parts:
+            part = re.sub(r"[✈️🚄🚗🚇🚌🚕🏁]+", " ", part)
+            part = re.split(r"[，,。；;]", part, maxsplit=1)[0]
+            part = part.strip()
+            if part:
+                nodes.append(part)
+    return nodes
+
+
+def _extract_quoted_place_nodes(line: str) -> list[str]:
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    text = cells[1] if len(cells) > 1 else line
+    # 餐饮行里的书名号通常是餐厅名/菜品名，放进路线图会让线路过细且易误配。
+    if re.search(r"早餐|午餐|晚餐|下午茶|餐厅|咖啡|火锅|米线|斋饭|菜", text):
+        return []
+    return [m.group(1) for m in re.finditer(r"[「『]([^」』]{2,30})[」』]", text)]
 
 
 def _resolve_city(key: str, destination: str) -> str:
@@ -206,6 +251,13 @@ def _resolve_nodes(key: str, city: str, names: list[str]) -> list[dict[str, str]
     resolved = []
     with httpx.Client(timeout=20.0) as client:
         for name in names:
+            # "武汉/昆明/大理"这类短城市名如果先搜 POI，容易命中"武汉鸭脖"等店铺；
+            # 优先地理编码到行政区，再用 POI 兜底。
+            if _prefer_geocode_first(name):
+                node = _geocode(client, key, name) or _search_poi(client, key, city, name)
+                if node:
+                    resolved.append(node)
+                continue
             # citylimit=true 把 POI 搜索圈死在目的地城市，杜绝"昆明的活动搜到河北"的跨省错配；
             # 搜不到用裸地名做地理编码兜底（不拼城市前缀——"广州市清晖园"会退化成广州市中心泛点，
             # 而裸"清晖园"能正确定位到顺德；偶发的跨省误配交给 _drop_outliers 剔除），
@@ -214,6 +266,10 @@ def _resolve_nodes(key: str, city: str, names: list[str]) -> list[dict[str, str]
             if node:
                 resolved.append(node)
     return resolved
+
+
+def _prefer_geocode_first(name: str) -> bool:
+    return bool(re.fullmatch(r"[一-龥]{2,3}", name)) or name.endswith(("市", "县", "区"))
 
 
 def _drop_outliers(resolved: list[dict[str, str]]) -> list[dict[str, str]]:

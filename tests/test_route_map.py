@@ -50,6 +50,30 @@ def test_extract_route_nodes_skips_activity_and_hint_text():
     assert route_map.extract_route_nodes(md) == ["大理古城", "双廊古镇"]
 
 
+def test_extract_route_nodes_from_route_overview_and_quoted_places():
+    md = (
+        "# 云南亲子自然风光 · 4日精华行程\n\n"
+        "**路线总览**：武汉 ✈️ → 昆明（中转）🚄→ 大理（深度游）"
+        "→ 苍山洱海环湖精华段 → 喜洲古镇 → 沙溪古镇 → 大理 🚄→ 昆明 ✈️ → 武汉，当地包车约160km轻松游。\n\n"
+        "### Day 1 · 抵达大理\n"
+        "| 时段 | 安排 | 耗时 | 提示 |\n"
+        "|------|------|------|------|\n"
+        "| 15:30 | 🏛️ 大理古城亲子漫步：人民路 → 洋人街 → 五华楼 | 2h | 轻松 |\n"
+        "| 18:00 | 🌇 「大理古城南门」城楼看苍山日落 | 1h | 免费 |\n"
+        "| 19:30 | 🍲 晚餐 · 「段公子·天龙八部主题餐厅」 | 1h | 不应进入路线图 |\n"
+    )
+
+    assert route_map.extract_route_nodes(md) == [
+        "武汉",
+        "昆明",
+        "大理",
+        "苍山洱海环湖精华段",
+        "喜洲古镇",
+        "沙溪古镇",
+        "大理古城南门",
+    ]
+
+
 def test_drop_outliers_removes_cross_province_mismatch():
     """混入一个被错配到 1900km 外的点时应被剔除，其余保留"""
     resolved = [
@@ -60,6 +84,35 @@ def test_drop_outliers_removes_cross_province_mismatch():
     ]
     kept = route_map._drop_outliers(resolved)
     assert [n["name"] for n in kept] == ["翠湖公园", "大理古城", "束河古镇"]
+
+
+def test_short_city_names_prefer_geocode_before_poi(monkeypatch):
+    calls = []
+
+    class DummyClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(route_map.httpx, "Client", lambda timeout: DummyClient())
+
+    def fake_geocode(client, key, name):
+        calls.append(("geo", name))
+        return {"name": f"{name}市", "location": "114.305,30.593"}
+
+    def fake_search(client, key, city, name):
+        calls.append(("poi", name))
+        return {"name": "武汉鸭脖", "location": "100.100,25.600"}
+
+    monkeypatch.setattr(route_map, "_geocode", fake_geocode)
+    monkeypatch.setattr(route_map, "_search_poi", fake_search)
+
+    assert route_map._resolve_nodes("k", "云南", ["武汉"]) == [
+        {"name": "武汉市", "location": "114.305,30.593"}
+    ]
+    assert calls == [("geo", "武汉")]
 
 
 def test_drop_outliers_keeps_legit_cross_city_chain():
