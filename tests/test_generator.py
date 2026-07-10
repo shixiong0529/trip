@@ -218,23 +218,41 @@ def test_to_html_has_hero_and_balanced_divs(gen):
     assert html.count("<div") == html.count("</div")
 
 
-def test_to_html_inserts_route_map_near_report_start(gen, monkeypatch):
-    monkeypatch.setattr(
-        "generator.build_route_map_html",
-        lambda markdown: '<div class="route-map-card">MAP</div>\n',
-    )
+def test_to_html_does_not_insert_route_map(gen):
     md = (
         "# 🗺️ 成都3日游\n\n"
         "3天2人，人均预算 ¥2,000\n\n"
         "**路线总览** 上海 → 成都。\n\n"
+        "## 🗺️ 全程路线图\n"
+        "按行程顺序绘制的线路示意图。\n\n"
+        "```text\n"
+        "上海 -> 成都\n"
+        "```\n\n"
         "## 🚄 城际交通建议\n"
         "交通内容\n"
     )
 
-    html = gen.to_html(md, "route-map")
+    html = gen.to_html(md, "no-route-map")
 
-    assert '<div class="route-map-card">MAP</div>' in html
-    assert html.index('<div class="route-map-card">MAP</div>') < html.index("路线总览")
+    assert 'class="route-map-card"' not in html
+    assert "全程路线图" not in html
+    assert "按行程顺序绘制" not in html
+    assert "上海 -&gt; 成都" not in html
+    assert "城际交通建议" in html
+
+
+def test_two_column_tables_use_compact_key_value_layout(gen):
+    md = (
+        "# 行前物品清单\n\n"
+        "## 🎒 行前物品清单\n"
+        "| 类别 | 物品 |\n"
+        "|------|------|\n"
+        "| 🍜 食物 | 自热米饭×6、压缩饼干×1 包、矿泉水 1 箱 |\n"
+    )
+
+    html = gen.to_html(md, "kv-table")
+
+    assert 'class="table-wrapper kv-table-wrapper"' in html
 
 
 def test_overview_route_and_important_tip_use_emphasis_classes():
@@ -250,6 +268,20 @@ def test_overview_route_and_important_tip_use_emphasis_classes():
     assert 'class="route-overview-card"' in html
     assert 'class="important-note-card"' in html
     assert "上海 → 成都 → 上海" in html
+
+
+def test_route_overview_card_removes_road_nodes():
+    md = (
+        "# 🗺️ 川藏行程\n\n"
+        "12天2人，人均预算 ¥8,000\n\n"
+        "**路线总览：** 成都 → G318川藏南线 → 拉萨 → G109青藏公路 → 西宁。\n"
+    )
+
+    html = _blocks_to_html_fragment(_parse_markdown_to_blocks(md))
+
+    assert "成都 → 拉萨 → 西宁" in html
+    assert "G318" not in html
+    assert "G109" not in html
 
 
 def test_disclaimer_truncates_followup_content(gen):

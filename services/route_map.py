@@ -1,84 +1,60 @@
 """
-高德静态路线图生成
+HTML 线路示意图生成
 
-从生成后的攻略 Markdown 中提取关键节点，使用高德 Web 服务解析坐标、
-规划路线路径，并把静态地图图片转成 base64 嵌入 HTML 报告。
+从生成后的攻略 Markdown 中提取关键节点，生成报告开头的轻量 SVG
+路线示意图。这里不使用真实地图底图，避免静态地图在长线/多节点
+行程中出现视野、标注和加载效果不可控的问题。
 """
 
-import base64
 import os
 import re
-from typing import Any
+from concurrent.futures import ThreadPoolExecutor
 
 import httpx
-from dotenv import load_dotenv
 
 
-AMAP_BASE_URL = "https://restapi.amap.com/v3"
 MAX_ROUTE_NODES = 10
-MAX_ROUTE_POINTS = 80
-
-load_dotenv()
 
 
-# 同一份 markdown 的路线图结果缓存（仅缓存成功结果）：
-# /view、重复下载等场景不再重复发起 ~20 个高德请求
+# 同一份 markdown 的路线图结果缓存（仅缓存成功结果）
 _route_map_cache: dict[int, str] = {}
 _ROUTE_MAP_CACHE_MAX = 16
+_coordinate_cache: dict[str, tuple[float, float] | None] = {}
+_COORDINATE_CACHE_MAX = 128
+
+_ROAD_NODE_RE = re.compile(
+    r"(?:^[GgSsXxYy]\s*\d+|高速|国道|省道|县道|乡道|公路|快速路|服务区|收费站|"
+    r"隧道|大桥|立交|路段|环线|川藏[南北]线|青甘大环线|高速启程)",
+)
 
 
 def build_route_map_html(markdown_content: str) -> str:
     """生成报告开头的全程路线图 HTML。失败时返回空串，不影响报告输出。"""
-    key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
-    if not key:
-        return ""
-
     cache_key = hash(markdown_content)
     cached = _route_map_cache.get(cache_key)
     if cached:
         return cached
 
-    names = extract_route_nodes(markdown_content)
-    if len(names) < 2:
+    items = extract_route_items(markdown_content)[:MAX_ROUTE_NODES]
+    if len(items) < 2:
         return ""
 
-    destination = _extract_destination(markdown_content)
     try:
-        city = _resolve_city(key, destination)
-        resolved = _resolve_nodes(key, city, names[:MAX_ROUTE_NODES])
-        # 剔除跨省错解析的离群点，避免地图视野被拉到全国、密集路线糊成一团
-        resolved = _drop_outliers(resolved)
-        if len(resolved) < 2:
-            return ""
-        route_points = _resolve_route_points(key, resolved)
-        image_bytes = _fetch_static_map(key, resolved, route_points)
-        if not image_bytes:
-            return ""
-        # 行程跨度大时（如市区景点 + 远郊长城），单张图里密集簇会被压成一团，
-        # 追加一张只含密集簇的"细节图"
-        detail = _build_detail_map(key, resolved, route_points)
+        diagram = _build_schematic_svg(items, _resolve_item_coordinates(items))
     except Exception:
         return ""
 
-    image_data = base64.b64encode(image_bytes).decode("ascii")
     legend = "".join(
-        f'<span class="route-map-chip" title="{chr(65 + idx)} {_escape_html(node["name"])}">'
-        f'<strong>{chr(65 + idx)}</strong> {_escape_html(node["name"])}</span>'
-        for idx, node in enumerate(resolved)
+        f'<span class="route-map-chip" title="{idx + 1}. {_escape_html(item["name"])}">'
+        f'<strong>{idx + 1}</strong> {_escape_html(item["name"])}</span>'
+        for idx, item in enumerate(items)
     )
-    detail_html = ""
-    if detail:
-        detail_data = base64.b64encode(detail).decode("ascii")
-        detail_html = (
-            '\n  <p class="route-map-subtitle">🔍 密集区域细节（标注字母与上图一致）</p>'
-            f'\n  <img class="route-map-image" src="data:image/png;base64,{detail_data}" alt="密集区域路线细节">'
-        )
     html = f"""<div class="route-map-card">
   <div class="route-map-header">
     <h2>🗺️ 全程路线图</h2>
-    <p>基于高德地图真实底图、POI 坐标与驾车路径生成，关键节点按行程顺序标注。</p>
+    <p>按路线总览中的城市、城镇与景点绘制，节点方位尽量贴近实际地理位置。</p>
   </div>
-  <img class="route-map-image" src="data:image/png;base64,{image_data}" alt="全程路线图">{detail_html}
+  <div class="route-map-diagram">{diagram}</div>
   <div class="route-map-legend">{legend}</div>
 </div>
 """
@@ -88,63 +64,187 @@ def build_route_map_html(markdown_content: str) -> str:
     return html
 
 
-def _build_detail_map(key: str, resolved: list[dict[str, str]], route_points: list[str]) -> bytes:
-    """行程整体跨度 > 60km 时，为密集簇（距中位中心 30km 内的点）生成细节图。
+def extract_route_items(markdown_content: str) -> list[dict[str, str]]:
+    """仅从“路线总览”提取地图节点，严格保持其先后顺序。
 
-    细节图上的标注字母沿用全程图的原字母，图例可以对照；
-    折线复用已算好的全程路径中落在簇范围内的点，不再发起新的路线请求。
-    返回空 bytes 表示不需要或生成失败（不影响主图输出）。
+    分日表里的餐厅、道路、活动名会让一张总览图变成密集的日程图，因此
+    不再作为补充来源。重复的起终点也保留，用于呈现环线或返程。
     """
-    if len(resolved) < 4:
-        return b""
+    return [
+        {"name": name, "day": f"第{index + 1}站"}
+        for index, name in enumerate(_extract_route_overview_nodes(markdown_content))
+    ]
 
-    def _to_xy(loc: str) -> tuple[float, float]:
-        lng, lat = loc.split(",")
-        return float(lng), float(lat)
 
-    def _median(values: list[float]) -> float:
-        s = sorted(values)
-        mid = len(s) // 2
-        return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
+def normalize_route_overview(content: str) -> str:
+    """将路线总览规范为只包含城市、城镇和景点节点的单行路线。"""
+    nodes = _extract_route_overview_nodes(content)
+    if len(nodes) < 2:
+        return content
+    return "**路线总览：** " + " → ".join(nodes)
 
-    def _dist_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-        return (((a[0] - b[0]) * 88) ** 2 + ((a[1] - b[1]) * 111) ** 2) ** 0.5
 
-    points = [_to_xy(n["location"]) for n in resolved]
-    # 整体跨度：bounding box 对角线
-    lngs = [p[0] for p in points]
-    lats = [p[1] for p in points]
-    span_km = _dist_km((min(lngs), min(lats)), (max(lngs), max(lats)))
-    if span_km < 60:
-        return b""  # 本来就紧凑，单图已够清晰
+def _build_schematic_svg(
+    items: list[dict[str, str]],
+    coordinates: list[tuple[float, float] | None] | None = None,
+) -> str:
+    width, height = 1200, 560
+    points = _geographic_points(coordinates or [], width, height) or _schematic_points(len(items))
+    segment_parts = []
+    marker_parts = []
 
-    center = (_median(lngs), _median(lats))
-    cluster_idx = [i for i, p in enumerate(points) if _dist_km(p, center) < 30]
-    # 密集簇至少 3 个点、且确实只是行程的一部分时才值得出细节图
-    if len(cluster_idx) < 3 or len(cluster_idx) == len(resolved):
-        return b""
+    for idx, (start, end) in enumerate(zip(points, points[1:])):
+        color, dashed, _ = _segment_style(idx, len(points))
+        dash_attr = ' stroke-dasharray="12 10"' if dashed else ""
+        segment_parts.append(
+            f'<line x1="{start[0]:.1f}" y1="{start[1]:.1f}" '
+            f'x2="{end[0]:.1f}" y2="{end[1]:.1f}" '
+            f'stroke="{color}" stroke-width="8" stroke-linecap="round"{dash_attr}/>'
+        )
 
-    cluster_nodes = [resolved[i] for i in cluster_idx]
-    cluster_labels = [chr(65 + i) for i in cluster_idx]
+    for idx, (item, point) in enumerate(zip(items, points)):
+        color, _, _ = _segment_style(max(idx - 1, 0), len(points))
+        if idx == 0:
+            color = "#2563eb"
+        elif idx == len(items) - 1:
+            color = "#dc2626"
+        radius = 19 if idx in {0, len(items) - 1} else 11
+        label_anchor = "middle"
+        label_x = point[0]
+        label_y = point[1] - 28 if idx % 2 == 0 else point[1] + 44
+        if point[0] < 170:
+            label_anchor = "start"
+            label_x = point[0] + 18
+        elif point[0] > width - 170:
+            label_anchor = "end"
+            label_x = point[0] - 18
+        day = item.get("day") or f"第{idx + 1}站"
+        name = _truncate_label(item["name"], 9)
+        marker_parts.append(
+            f'<circle cx="{point[0]:.1f}" cy="{point[1]:.1f}" r="{radius + 5}" fill="#fff" opacity=".95"/>'
+            f'<circle cx="{point[0]:.1f}" cy="{point[1]:.1f}" r="{radius}" fill="{color}" stroke="#fff" stroke-width="4"/>'
+            f'<text x="{label_x:.1f}" y="{label_y:.1f}" class="route-svg-node-label" '
+            f'text-anchor="{label_anchor}">{_escape_html(name)} · {_escape_html(day)}</text>'
+        )
 
-    # 复用全程折线中落在簇 bbox（外扩约 5km）内的点
-    c_pts = [points[i] for i in cluster_idx]
-    pad = 0.06
-    min_lng, max_lng = min(p[0] for p in c_pts) - pad, max(p[0] for p in c_pts) + pad
-    min_lat, max_lat = min(p[1] for p in c_pts) - pad, max(p[1] for p in c_pts) + pad
-    detail_points = []
-    for loc in route_points:
-        try:
-            x, y = _to_xy(loc)
-        except (ValueError, TypeError):
-            continue
-        if min_lng <= x <= max_lng and min_lat <= y <= max_lat:
-            detail_points.append(loc)
+    return f"""<svg class="route-map-svg" viewBox="0 0 {width} {height}" role="img" aria-label="全程线路示意图">
+  <rect x="0" y="0" width="{width}" height="{height}" rx="24" fill="#edf2f7"/>
+  <text x="{width / 2}" y="54" class="route-svg-title" text-anchor="middle">行程线路示意图</text>
+  <g class="route-svg-lines">{''.join(segment_parts)}</g>
+  <g class="route-svg-markers">{''.join(marker_parts)}</g>
+  <g class="route-svg-legend">
+    <rect x="855" y="420" width="300" height="104" rx="14" fill="#ffffff" opacity=".92"/>
+    <text x="885" y="456" class="route-svg-legend-title">图例</text>
+    <line x1="885" y1="482" x2="955" y2="482" stroke="#7c3aed" stroke-width="6" stroke-linecap="round"/>
+    <text x="970" y="488" class="route-svg-legend-text">行程主线</text>
+    <line x1="885" y1="508" x2="955" y2="508" stroke="#16a34a" stroke-width="6" stroke-linecap="round"/>
+    <text x="970" y="514" class="route-svg-legend-text">延伸 / 返程线</text>
+  </g>
+</svg>"""
 
+
+def _resolve_item_coordinates(items: list[dict[str, str]]) -> list[tuple[float, float] | None]:
+    """并行查询高德地理编码，失败时返回空坐标并由 SVG 使用保底布局。"""
+    key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
+    if not key:
+        return [None] * len(items)
+
+    names = [item["name"] for item in items]
+    unresolved = list(dict.fromkeys(name for name in names if name not in _coordinate_cache))
+    if unresolved:
+        workers = min(4, len(unresolved))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            results = executor.map(lambda name: _geocode_place(name, key), unresolved)
+            for name, coordinate in zip(unresolved, results):
+                if len(_coordinate_cache) >= _COORDINATE_CACHE_MAX:
+                    _coordinate_cache.clear()
+                _coordinate_cache[name] = coordinate
+
+    return [_coordinate_cache.get(name) for name in names]
+
+
+def _geocode_place(name: str, key: str) -> tuple[float, float] | None:
     try:
-        return _fetch_static_map(key, cluster_nodes, detail_points, labels=cluster_labels)
-    except Exception:
-        return b""
+        response = httpx.get(
+            "https://restapi.amap.com/v3/geocode/geo",
+            params={"key": key, "address": name},
+            timeout=3.0,
+        )
+        payload = response.json()
+        geocodes = payload.get("geocodes") or []
+        location = geocodes[0].get("location", "") if payload.get("status") == "1" and geocodes else ""
+        longitude, latitude = location.split(",", maxsplit=1)
+        return float(longitude), float(latitude)
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError):
+        return None
+
+
+def _geographic_points(
+    coordinates: list[tuple[float, float] | None], width: int, height: int,
+) -> list[tuple[float, float]] | None:
+    """将经纬度投影到 SVG，让左右/上下方向与真实地图大致一致。"""
+    if len(coordinates) < 2 or any(point is None for point in coordinates):
+        return None
+
+    resolved = [point for point in coordinates if point is not None]
+    longitudes = [point[0] for point in resolved]
+    latitudes = [point[1] for point in resolved]
+    lon_span = max(longitudes) - min(longitudes)
+    lat_span = max(latitudes) - min(latitudes)
+    if lon_span < 0.03 and lat_span < 0.03:
+        return None
+
+    left, right = 90.0, width - 90.0
+    top, bottom = 100.0, height - 150.0
+    safe_lon_span = max(lon_span, 0.12)
+    safe_lat_span = max(lat_span, 0.12)
+    return [
+        (
+            left + (longitude - min(longitudes)) / safe_lon_span * (right - left),
+            bottom - (latitude - min(latitudes)) / safe_lat_span * (bottom - top),
+        )
+        for longitude, latitude in resolved
+    ]
+
+
+def _schematic_points(count: int) -> list[tuple[float, float]]:
+    template = [
+        (1030.0, 390.0), (910.0, 300.0), (790.0, 190.0), (650.0, 125.0),
+        (505.0, 165.0), (385.0, 260.0), (275.0, 365.0), (430.0, 430.0),
+        (610.0, 405.0), (790.0, 445.0), (965.0, 400.0), (1085.0, 470.0),
+    ]
+    if count <= 1:
+        return template[:1]
+    if count >= len(template):
+        return template[:count]
+    points = []
+    max_index = len(template) - 1
+    for idx in range(count):
+        pos = idx * max_index / (count - 1)
+        left = int(pos)
+        right = min(left + 1, max_index)
+        ratio = pos - left
+        x = template[left][0] + (template[right][0] - template[left][0]) * ratio
+        y = template[left][1] + (template[right][1] - template[left][1]) * ratio
+        points.append((x, y))
+    return points
+
+
+def _segment_style(index: int, point_count: int) -> tuple[str, bool, str]:
+    if point_count <= 3:
+        return "#7c3aed", False, "行程主线"
+    if index == 0:
+        return "#64748b", True, "交通衔接"
+    last_segment = max(point_count - 2, 1)
+    if index >= last_segment * 0.66:
+        return "#16a34a", False, "延伸 / 返程线"
+    if index >= last_segment * 0.38:
+        return "#d97706", False, "重点游览线"
+    return "#7c3aed", False, "行程主线"
+
+
+def _truncate_label(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit] + "…"
 
 
 def extract_route_nodes(markdown_content: str) -> list[str]:
@@ -205,9 +305,9 @@ def _extract_route_overview_nodes(markdown_content: str) -> list[str]:
         for part in parts:
             part = re.sub(r"[✈️🚄🚗🚇🚌🚕🏁]+", " ", part)
             part = re.split(r"[，,。；;]", part, maxsplit=1)[0]
-            part = part.strip()
-            if part:
-                nodes.append(part)
+            name = _clean_node_name(part)
+            if _looks_like_place(name):
+                nodes.append(name)
     return nodes
 
 
@@ -220,207 +320,10 @@ def _extract_quoted_place_nodes(line: str) -> list[str]:
     return [m.group(1) for m in re.finditer(r"[「『]([^」』]{2,30})[」』]", text)]
 
 
-def _resolve_city(key: str, destination: str) -> str:
-    """把标题里提取的目的地字符串规整成高德可识别的城市名。
-
-    标题提取可能带杂质（如"云南亲子自然"），逐步截短做地理编码，
-    取第一个能编码成功的形态；全部失败则原样返回。
-    """
-    candidates = [destination, destination[:4], destination[:2]]
-    seen = set()
-    with httpx.Client(timeout=20.0) as client:
-        for cand in candidates:
-            cand = cand.strip()
-            if len(cand) < 2 or cand in seen:
-                continue
-            seen.add(cand)
-            geo = _geocode_raw(client, key, cand)
-            if geo:
-                # 优先市级名；省级查询（如"云南"）city 字段为空列表，退回省名
-                city = geo.get("city")
-                if isinstance(city, str) and city:
-                    return city
-                province = geo.get("province")
-                if isinstance(province, str) and province:
-                    return province
-                return cand
-    return destination
-
-
-def _resolve_nodes(key: str, city: str, names: list[str]) -> list[dict[str, str]]:
-    resolved = []
-    with httpx.Client(timeout=20.0) as client:
-        for name in names:
-            # "武汉/昆明/大理"这类短城市名如果先搜 POI，容易命中"武汉鸭脖"等店铺；
-            # 优先地理编码到行政区，再用 POI 兜底。
-            if _prefer_geocode_first(name):
-                node = _geocode(client, key, name) or _search_poi(client, key, city, name)
-                if node:
-                    resolved.append(node)
-                continue
-            # citylimit=true 把 POI 搜索圈死在目的地城市，杜绝"昆明的活动搜到河北"的跨省错配；
-            # 搜不到用裸地名做地理编码兜底（不拼城市前缀——"广州市清晖园"会退化成广州市中心泛点，
-            # 而裸"清晖园"能正确定位到顺德；偶发的跨省误配交给 _drop_outliers 剔除），
-            # 仍失败则丢弃该节点
-            node = _search_poi(client, key, city, name) or _geocode(client, key, name)
-            if node:
-                resolved.append(node)
-    return resolved
-
-
-def _prefer_geocode_first(name: str) -> bool:
-    return bool(re.fullmatch(r"[一-龥]{2,3}", name)) or name.endswith(("市", "县", "区"))
-
-
-def _drop_outliers(resolved: list[dict[str, str]]) -> list[dict[str, str]]:
-    """剔除明显错解析的离群节点。
-
-    用中位数坐标作为中心（对离群点天然鲁棒，不像均值会被单个远点拉偏），
-    各点到中位中心的距离超过 max(300km, 3×中位距离) 即剔除：
-    - 昆明→大理→丽江这类真实跨城行程（点间 100-260km）不会被误杀；
-    - 被错配到外省的点（如云南行程里出现 1900km 外的河北 POI）会被剔除。
-    """
-    if len(resolved) < 3:
-        return resolved
-
-    def _to_xy(loc: str) -> tuple[float, float]:
-        lng, lat = loc.split(",")
-        return float(lng), float(lat)
-
-    def _median(values: list[float]) -> float:
-        s = sorted(values)
-        mid = len(s) // 2
-        return s[mid] if len(s) % 2 else (s[mid - 1] + s[mid]) / 2
-
-    points = [_to_xy(n["location"]) for n in resolved]
-    center = (_median([p[0] for p in points]), _median([p[1] for p in points]))
-
-    def _dist_km(a: tuple[float, float], b: tuple[float, float]) -> float:
-        # 中国纬度范围内的近似换算：1° 经度 ≈ 88km，1° 纬度 ≈ 111km
-        return (((a[0] - b[0]) * 88) ** 2 + ((a[1] - b[1]) * 111) ** 2) ** 0.5
-
-    dists = [_dist_km(p, center) for p in points]
-    threshold = max(300.0, _median(dists) * 3)
-    return [n for n, d in zip(resolved, dists) if d <= threshold]
-
-
-def _resolve_route_points(key: str, resolved: list[dict[str, str]]) -> list[str]:
-    points: list[str] = []
-    with httpx.Client(timeout=20.0) as client:
-        for current, nxt in zip(resolved, resolved[1:]):
-            segment = _driving_polyline(client, key, current["location"], nxt["location"])
-            if not segment:
-                segment = [current["location"], nxt["location"]]
-            for point in segment:
-                if not points or points[-1] != point:
-                    points.append(point)
-    return _downsample(points, MAX_ROUTE_POINTS)
-
-
-def _fetch_static_map(
-    key: str,
-    resolved: list[dict[str, str]],
-    route_points: list[str],
-    labels: list[str] | None = None,
-) -> bytes:
-    """labels 缺省按 A、B、C…顺序编号；细节图传入原字母保持与图例一致"""
-    if labels is None:
-        labels = [chr(65 + idx) for idx in range(len(resolved))]
-    markers = "|".join(
-        f"mid,0x2563eb,{label}:{node['location']}"
-        for label, node in zip(labels, resolved[:MAX_ROUTE_NODES])
-    )
-    # 不再使用 labels 参数：POI 名称里的逗号/冒号会撕碎高德的样式字段格式导致生图失败，
-    # 且中文 URL 编码后体积巨大。地点名由图下方的 A-J 图例承担。
-    paths = f"6,0x2563eb,0.85,,:{';'.join(route_points)}" if route_points else ""
-    params = {
-        "key": key,
-        # 高德静态图 scale=2 时 size 上限 512*512，此前 900*420 超限属未定义行为
-        "size": "512*320",
-        "scale": "2",
-        "markers": markers,
-        "paths": paths,
-    }
-    with httpx.Client(timeout=20.0) as client:
-        resp = client.get(f"{AMAP_BASE_URL}/staticmap", params=params)
-        resp.raise_for_status()
-        content_type = resp.headers.get("content-type", "")
-        if "image" not in content_type:
-            return b""
-        return resp.content
-
-
-def _search_poi(client: httpx.Client, key: str, city: str, name: str) -> dict[str, str]:
-    data = _request(client, key, "/place/text", {
-        "keywords": name,
-        "city": city,
-        "citylimit": "true",
-        "offset": 1,
-        "page": 1,
-        "extensions": "base",
-    })
-    pois = data.get("pois") or []
-    if not pois:
-        return {}
-    poi = pois[0]
-    location = poi.get("location")
-    if not location:
-        return {}
-    return {"name": poi.get("name") or name, "location": location}
-
-
-def _geocode_raw(client: httpx.Client, key: str, address: str) -> dict[str, Any]:
-    """返回高德地理编码的原始结果（含 city/province/adcode 等字段）"""
-    data = _request(client, key, "/geocode/geo", {"address": address})
-    geocodes = data.get("geocodes") or []
-    return geocodes[0] if geocodes else {}
-
-
-def _geocode(client: httpx.Client, key: str, address: str) -> dict[str, str]:
-    geocode = _geocode_raw(client, key, address)
-    location = geocode.get("location")
-    if not location:
-        return {}
-    return {"name": geocode.get("formatted_address") or address, "location": location}
-
-
-def _driving_polyline(client: httpx.Client, key: str, origin: str, destination: str) -> list[str]:
-    data = _request(client, key, "/direction/driving", {
-        "origin": origin,
-        "destination": destination,
-        "extensions": "base",
-    })
-    paths = (data.get("route") or {}).get("paths") or []
-    if not paths:
-        return []
-    points: list[str] = []
-    for step in paths[0].get("steps") or []:
-        polyline = step.get("polyline") or ""
-        for point in polyline.split(";"):
-            if point and (not points or points[-1] != point):
-                points.append(point)
-    return points
-
-
-def _request(client: httpx.Client, key: str, path: str, params: dict[str, Any]) -> dict[str, Any]:
-    payload = {**params, "key": key, "output": "json"}
-    resp = client.get(f"{AMAP_BASE_URL}{path}", params=payload)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("status") != "1":
-        return {}
-    return data
-
-
-def _extract_destination(markdown_content: str) -> str:
-    first_line = markdown_content.splitlines()[0] if markdown_content.splitlines() else ""
-    m = re.search(r"[\U0001f300-\U0001faff\ufe0f\s]*([一-龥]{2,6})", first_line)
-    return m.group(1) if m else ""
-
-
 def _clean_node_name(name: str) -> str:
+    name = re.sub(r"\*", "", name)
     name = re.sub(r"[（(].*?[）)]", "", name)
-    name = re.sub(r"^(直奔|前往|游览|夜游|午餐|晚餐|早餐|打卡)", "", name)
+    name = re.sub(r"^(从|经|途经|经过|抵达|到达|前往|返回|回到|出发|直奔|游览|夜游|午餐|晚餐|早餐|打卡)\s*", "", name)
     # "昆明老街/南强街"这类并列写法取前半段，斜杠原文拿去搜 POI 必然失败
     name = name.split("/")[0].split("／")[0]
     return name.strip(" ：:，,。·-")
@@ -434,21 +337,11 @@ def _looks_like_place(name: str) -> bool:
         # 活动/提示类加粗文本不是地名，拿去搜 POI 会跨省错配（如"生态廊道骑行"曾配到河北）
         "骑行", "徒步", "体验", "自由活动", "预约", "无法", "建议", "提示", "注意",
         "集合", "返程", "入住", "退房", "休整", "自理", "打卡", "路线", "行程",
-        "周边",  # "大理古城周边民宿"这类模糊描述会被 POI 搜索乱配
+        "周边", "环湖", "精华段",  # "大理古城周边民宿"这类模糊描述会被 POI 搜索乱配
     )
-    if "¥" in name or "￥" in name:
+    if "¥" in name or "￥" in name or _ROAD_NODE_RE.search(name):
         return False
     return not any(word in name for word in blocked)
-
-
-def _downsample(points: list[str], limit: int) -> list[str]:
-    if len(points) <= limit:
-        return points
-    step = (len(points) - 1) / (limit - 1)
-    sampled = [points[round(i * step)] for i in range(limit)]
-    sampled[0] = points[0]
-    sampled[-1] = points[-1]
-    return sampled
 
 
 def _escape_html(text: str) -> str:

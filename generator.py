@@ -19,7 +19,7 @@ from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
-from services.route_map import build_route_map_html
+from services.route_map import normalize_route_overview
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +169,7 @@ def _parse_table(lines: list[str]) -> list[list[str]]:
 
 
 # ---------- HTML 生成 ----------
-def _blocks_to_html_fragment(blocks: list[dict], route_map_html: str = "") -> str:
+def _blocks_to_html_fragment(blocks: list[dict]) -> str:
     """将块转为 HTML Report Generator 风格的片段"""
     html = ""
     i = 0
@@ -185,8 +185,6 @@ def _blocks_to_html_fragment(blocks: list[dict], route_map_html: str = "") -> st
         if t == "h1":
             html += _render_hero(content)
             in_container = True
-            if route_map_html:
-                html += route_map_html
             # 接下来的 1-3 个段落通常是概览统计 + 路线总览 + 重要提示
             overview_paras = []
             j = i + 1
@@ -199,6 +197,11 @@ def _blocks_to_html_fragment(blocks: list[dict], route_map_html: str = "") -> st
 
         # H2 分节标题 → Section
         elif t == "h2":
+            if _is_route_map_section(content):
+                i += 1
+                while i < len(blocks) and blocks[i]["type"] != "h2":
+                    i += 1
+                continue
             if in_section:
                 html += "</div>\n"  # 关闭上一个 section
             slug = re.sub(r"[^\w\u4e00-\u9fff]+", "-", content).strip("-")
@@ -281,11 +284,16 @@ def _render_hero(title: str) -> str:
   <p class="meta">AI 旅行管家 · 路小鲜（Leo）定制</p>
   <div class="tags">
     <span class="tag">多源数据</span>
-    <span class="tag">高德路线图</span>
     <span class="tag">可执行行程</span>
   </div>
 </div>
 '''
+
+
+def _is_route_map_section(title: str) -> bool:
+    """识别并丢弃模型偶尔输出的路线图章节。"""
+    compact = re.sub(r"\s+", "", title)
+    return "路线图" in compact or "线路示意图" in compact
 
 
 def _render_overview(paras: list[str]) -> str:
@@ -307,7 +315,7 @@ def _render_overview(paras: list[str]) -> str:
 def _render_paragraph_card(content: str) -> str:
     """根据段落语义渲染重点卡片。"""
     if "路线总览" in content:
-        return f'<div class="route-overview-card"><p>{_inline_md(content)}</p></div>\n'
+        return f'<div class="route-overview-card"><p>{_inline_md(normalize_route_overview(content))}</p></div>\n'
     if "重要提示" in content:
         return f'<div class="important-note-card"><p>{_inline_md(content)}</p></div>\n'
     return f'<div class="card"><p>{_inline_md(content)}</p></div>\n'
@@ -425,7 +433,10 @@ def _render_table(rows: list[list[str]]) -> str:
     trs = ""
     for row in rows[1:]:
         trs += "<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in row) + "</tr>"
-    return f'<div class="table-wrapper"><table><thead>{th}</thead><tbody>{trs}</tbody></table></div>\n'
+    wrapper_class = "table-wrapper"
+    if len(rows[0]) == 2:
+        wrapper_class += " kv-table-wrapper"
+    return f'<div class="{wrapper_class}"><table><thead>{th}</thead><tbody>{trs}</tbody></table></div>\n'
 
 
 
@@ -484,8 +495,7 @@ class TravelGuideGenerator:
     def to_html(self, markdown_content: str, guide_id: str) -> str:
         """Markdown → 完整 HTML 页面"""
         blocks = _parse_markdown_to_blocks(markdown_content)
-        route_map_html = build_route_map_html(markdown_content)
-        body_html = _blocks_to_html_fragment(blocks, route_map_html=route_map_html)
+        body_html = _blocks_to_html_fragment(blocks)
 
         # 尝试从 h1 提取标题
         title = "旅行攻略"
