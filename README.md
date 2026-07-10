@@ -83,6 +83,19 @@ apt install -y libpango-1.0-0 libpangoft2-1.0-0 libcairo2 libgobject-2.0-0 libgd
 
 线上部署使用 systemd 常驻运行、Nginx 反向代理、`acme.sh + DNS-01` 自动续期证书。详细步骤见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
 
+服务器更新：
+
+```bash
+cd /opt/trip
+git pull origin master
+source .venv/bin/activate
+pip install -r requirements.txt
+systemctl restart trip
+sleep 5
+systemctl status trip --no-pager | head -30
+curl https://trip.moyu.in/api/health
+```
+
 ## API
 
 | 接口 | 说明 |
