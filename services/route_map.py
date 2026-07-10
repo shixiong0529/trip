@@ -21,11 +21,22 @@ MAX_ROUTE_POINTS = 80
 load_dotenv()
 
 
+# 同一份 markdown 的路线图结果缓存（仅缓存成功结果）：
+# /view、重复下载等场景不再重复发起 ~20 个高德请求
+_route_map_cache: dict[int, str] = {}
+_ROUTE_MAP_CACHE_MAX = 16
+
+
 def build_route_map_html(markdown_content: str) -> str:
     """生成报告开头的全程路线图 HTML。失败时返回空串，不影响报告输出。"""
     key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
     if not key:
         return ""
+
+    cache_key = hash(markdown_content)
+    cached = _route_map_cache.get(cache_key)
+    if cached:
+        return cached
 
     names = extract_route_nodes(markdown_content)
     if len(names) < 2:
@@ -49,7 +60,7 @@ def build_route_map_html(markdown_content: str) -> str:
         f'<strong>{chr(65 + idx)}</strong> {_escape_html(node["name"])}</span>'
         for idx, node in enumerate(resolved)
     )
-    return f"""<div class="route-map-card">
+    html = f"""<div class="route-map-card">
   <div class="route-map-header">
     <h2>🗺️ 全程路线图</h2>
     <p>基于高德地图真实底图、POI 坐标与驾车路径生成，关键节点按行程顺序标注。</p>
@@ -58,6 +69,10 @@ def build_route_map_html(markdown_content: str) -> str:
   <div class="route-map-legend">{legend}</div>
 </div>
 """
+    if len(_route_map_cache) >= _ROUTE_MAP_CACHE_MAX:
+        _route_map_cache.clear()
+    _route_map_cache[cache_key] = html
+    return html
 
 
 def extract_route_nodes(markdown_content: str) -> list[str]:

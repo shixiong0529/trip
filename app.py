@@ -110,10 +110,12 @@ async def generate_guide(request: Request):
                     return
 
             # 生成完成后，渲染 HTML
+            # to_html 内含路线图生成（同步串行 HTTP，可达数十秒），必须放线程池，
+            # 否则会阻塞事件循环、卡住其他用户的请求
             guid = str(uuid.uuid4())[:8]
             from generator import TravelGuideGenerator
             gen = TravelGuideGenerator(app_config.templates_dir)
-            html_content = gen.to_html(full_markdown, guid)
+            html_content = await asyncio.to_thread(gen.to_html, full_markdown, guid)
 
             # 缓存
             _clean_cache()
@@ -157,7 +159,8 @@ async def download_guide(guide_id: str, format: str = Query("html")):
 
     if format == "pdf":
         try:
-            pdf_bytes = gen.to_pdf(guide["html"], guide_id)
+            # WeasyPrint 渲染是重 CPU 同步操作，放线程池避免阻塞事件循环
+            pdf_bytes = await asyncio.to_thread(gen.to_pdf, guide["html"], guide_id)
             return Response(
                 content=pdf_bytes,
                 media_type="application/pdf",
@@ -167,7 +170,7 @@ async def download_guide(guide_id: str, format: str = Query("html")):
             raise HTTPException(status_code=503, detail=str(e))
 
     elif format == "docx":
-        docx_bytes = gen.to_docx(guide["markdown"], guide_id)
+        docx_bytes = await asyncio.to_thread(gen.to_docx, guide["markdown"], guide_id)
         return Response(
             content=docx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -250,7 +253,8 @@ async def view_trip(trip_id: str):
 
     from generator import TravelGuideGenerator
     gen = TravelGuideGenerator(app_config.templates_dir)
-    html_content = gen.to_html(trip.get("markdown") or "", trip_id)
+    # to_html 含路线图同步 HTTP 调用，放线程池避免阻塞事件循环
+    html_content = await asyncio.to_thread(gen.to_html, trip.get("markdown") or "", trip_id)
     return HTMLResponse(content=html_content)
 
 

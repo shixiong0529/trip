@@ -133,10 +133,29 @@ async def _query_amap_reference(dest: str, org: Optional[str]) -> str:
         return ""
 
 
+# 命中这些词说明抓到的是需求描述而非地名（如"一份详细的旅游攻略"里的"份详细"）
+_PLACE_STOPWORDS = ("详细", "攻略", "行程", "计划", "方案", "推荐", "什么", "哪里", "帮我", "出发")
+_PLACE_PREFIXES = ("一个", "一份", "这个", "那个", "从", "去", "到")
+
+
+def _clean_place(name: Optional[str]) -> Optional[str]:
+    """清洗提取到的地名：剥掉助词前缀，剔除明显不是地名的捕获"""
+    if not name:
+        return None
+    for prefix in _PLACE_PREFIXES:
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+            break
+    name = name.strip("的")
+    if len(name) < 2 or any(w in name for w in _PLACE_STOPWORDS):
+        return None
+    return name
+
+
 def _extract_destination(query: str) -> Optional[str]:
     """简单提取目的地，提取失败返回 None"""
     patterns = [
-        r"(?:从)?[一-龥]{2,4}出发(?:去|到|飞|自驾)?([一-龥]{2,4})(?:玩|旅游|旅行|游|度假|待|自驾|\d|$)",
+        r"(?:从)?[一-龥]{2,4}出发(?:去|到|飞|自驾)?([一-龥]{2,4}?)(?:玩|旅游|旅行|游|度假|待|自驾|\d|$)",
         r"(?:去|到|在|飞|自驾)([一-龥]{2,4}?)(?:玩|旅游|旅行|游|度假|待|自驾|\d)",
         r"([一-龥]{2,4})\d*日游",
         r"([一-龥]{2,4})(?:旅游|旅行|亲子游|自由行|深度游|美食之旅|赏樱|环线)",
@@ -145,18 +164,22 @@ def _extract_destination(query: str) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, query)
         if m:
-            return m.group(1)
+            place = _clean_place(m.group(1))
+            if place:
+                return place
     return None
 
 
 def _extract_origin(query: str) -> Optional[str]:
     """简单提取出发地"""
     patterns = [
-        r"从([一-龥]{2,4})[出发出到去]",
-        r"([一-龥]{2,4})出发",
+        r"从([一-龥]{2,4}?)(?:出发|[出到去])",
+        r"([一-龥]{2,4}?)出发",
     ]
     for pat in patterns:
         m = re.search(pat, query)
         if m:
-            return m.group(1)
+            place = _clean_place(m.group(1))
+            if place:
+                return place
     return None
