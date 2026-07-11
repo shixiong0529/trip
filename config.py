@@ -16,7 +16,10 @@ class LLMConfig:
         self.base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com/v1")
         self.api_key = os.getenv("LLM_API_KEY", "")
         self.model = os.getenv("LLM_MODEL", "deepseek-chat")
-        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "8192"))
+        # 16384:实测 deepseek-v4 接受;上限给足可避免 12 天以上长行程输出被
+        # 8192 截断后触发自动续写(续写会让生成总时长接近翻倍)。
+        # max_tokens 只是截断上限,按实际生成量计费,调大无额外成本
+        self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "16384"))
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.7"))
 
     @property

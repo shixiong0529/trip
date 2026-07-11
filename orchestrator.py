@@ -24,26 +24,28 @@ class LLMClientError(Exception):
 class LLMClient:
     """OpenAI 兼容 API 客户端（httpx 直接调用）"""
 
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(
+        self, base_url: str, api_key: str, model: str,
+        max_tokens: int = 16384, temperature: float = 0.7,
+    ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
+        self.max_tokens = max_tokens
+        self.temperature = temperature
         self.last_finish_reason = None
 
     @property
     def chat_url(self) -> str:
         return f"{self.base_url}/chat/completions"
 
-    def _build_payload(
-        self, messages: list[dict], stream: bool = True,
-        max_tokens: int = 8192, temperature: float = 0.7
-    ) -> dict:
+    def _build_payload(self, messages: list[dict], stream: bool = True) -> dict:
         return {
             "model": self.model,
             "messages": messages,
             "stream": stream,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
         }
 
     async def chat_stream(self, messages: list[dict]) -> AsyncGenerator[str, None]:
@@ -102,7 +104,14 @@ class TravelGuideOrchestrator:
     def __init__(self, base_url: str, api_key: str, model: str):
         if not api_key:
             raise LLMClientError("未配置 API Key，请在 .env 文件中设置 LLM_API_KEY")
-        self.llm = LLMClient(base_url, api_key, model)
+        # max_tokens 从配置读取（.env 的 LLM_MAX_TOKENS）：上限给足可避免长行程
+        # 输出被 8192 截断而触发自动续写——续写会让总生成时间接近翻倍
+        from config import llm_config
+        self.llm = LLMClient(
+            base_url, api_key, model,
+            max_tokens=llm_config.max_tokens,
+            temperature=llm_config.temperature,
+        )
 
     async def generate(self, query: str) -> AsyncGenerator[dict, None]:
         """两阶段生成攻略
