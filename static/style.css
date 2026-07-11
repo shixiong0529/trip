@@ -672,7 +672,7 @@ body {
    ============================================================ */
 @media (max-width: 640px) {
   .bg-scene {
-    background: url('/static/shatan-mobile.jpg') center center / cover no-repeat scroll;
+    background: url('/static/mbbg1-mobile.jpg') center center / cover no-repeat scroll;
     filter: none;
   }
 
