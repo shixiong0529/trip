@@ -26,7 +26,8 @@ services/cache/
 generated-guide-preview.html
 generated-guide-preview.md
 
-# 设计过程产物（正式使用的 logo 在 static/logo-nav.png）
+# 设计过程产物（正式使用的 logo/背景在 static/ 下）
 /log*.png
 /logo*.png
+/bg*.jpg
 static/logo1-report.png
