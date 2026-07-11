@@ -281,7 +281,7 @@ def _render_hero(title: str) -> str:
     return f'''<div class="container">
 <div class="hero">
   <h1>{_inline_md(title)}</h1>
-  <p class="meta">AI 旅行管家 · 路小鲜（Leo）定制</p>
+  <p class="meta">AI 旅行管家 · 路小仙（Leo）定制</p>
   <div class="tags">
     <span class="tag">多源数据</span>
     <span class="tag">可执行行程</span>

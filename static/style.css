@@ -42,7 +42,8 @@ body {
   position: fixed;
   inset: 0;
   z-index: -2;
-  background: url('/static/pcbg3-desktop.jpg') center 38% / cover no-repeat fixed;
+  background: url('/static/pcbg6-desktop.jpg') center 38% / cover no-repeat fixed;
+  filter: brightness(0.65);
 }
 
 /* ---------- 悬浮药丸导航 ---------- */
@@ -672,6 +673,7 @@ body {
 @media (max-width: 640px) {
   .bg-scene {
     background: url('/static/shatan-mobile.jpg') center center / cover no-repeat scroll;
+    filter: none;
   }
 
   /* ---- 悬浮导航：贴合刘海屏，品牌与页签各自呼吸 ---- */
