@@ -671,7 +671,7 @@ body {
    ============================================================ */
 @media (max-width: 640px) {
   .bg-scene {
-    background: url('/static/xrk-mobile.jpg') center center / cover no-repeat scroll;
+    background: url('/static/shatan-mobile.jpg') center center / cover no-repeat scroll;
   }
 
   /* ---- 悬浮导航：贴合刘海屏，品牌与页签各自呼吸 ---- */
