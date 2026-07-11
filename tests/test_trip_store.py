@@ -5,6 +5,7 @@ services/trip_store.py 覆盖测试：行程 CRUD、攻略缓存、携程问道�
 """
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -60,6 +61,26 @@ def test_save_and_get_guide(isolated_db):
 def test_get_guide_missing_returns_none(isolated_db):
     trip_store = isolated_db
     assert trip_store.get_guide("does-not-exist") is None
+
+
+def test_concurrent_guide_writes_are_not_lost(isolated_db):
+    trip_store = isolated_db
+    guide_ids = [f"concurrent-{index}" for index in range(24)]
+
+    def save(guide_id: str):
+        trip_store.save_guide(
+            guide_id,
+            f"<html>{guide_id}</html>",
+            f"# {guide_id}",
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(save, guide_ids))
+
+    for guide_id in guide_ids:
+        guide = trip_store.get_guide(guide_id)
+        assert guide is not None
+        assert guide["markdown"] == f"# {guide_id}"
 
 
 def test_clean_expired_guides_removes_stale_entries(isolated_db):

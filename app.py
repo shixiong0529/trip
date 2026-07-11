@@ -7,6 +7,7 @@ FastAPI 应用主入口
 
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request, Query, HTTPException
@@ -37,13 +38,49 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+class _ConcurrencyGate:
+    """为长耗时任务提供有界并发，并暴露轻量运行状态。"""
+
+    def __init__(self, capacity: int):
+        self.capacity = max(1, capacity)
+        self.active = 0
+        self.waiting = 0
+        self._semaphore = asyncio.Semaphore(self.capacity)
+
+    @asynccontextmanager
+    async def slot(self):
+        self.waiting += 1
+        try:
+            await self._semaphore.acquire()
+        except BaseException:
+            self.waiting -= 1
+            raise
+
+        self.waiting -= 1
+        self.active += 1
+        try:
+            yield
+        finally:
+            self.active -= 1
+            self._semaphore.release()
+
+
+_generation_gate = _ConcurrencyGate(app_config.generation_max_concurrency)
+_export_gate = _ConcurrencyGate(app_config.export_max_concurrency)
+
 # ---------- 攻略缓存（SQLite 持久化，见 services/trip_store.py） ----------
 
-def _clean_cache():
+def _clean_cache_sync():
     """清理过期缓存（攻略 + 携程问道查询缓存）"""
     from services import trip_store
     trip_store.clean_expired_guides(app_config.guide_cache_ttl)
     trip_store.clean_expired_wendao_cache(app_config.wendao_cache_ttl)
+
+
+async def _clean_cache():
+    # SQLite 遇到短暂写锁时可能等待，不能让它阻塞所有异步请求。
+    await asyncio.to_thread(_clean_cache_sync)
 
 
 # ---------- 健康检查 ----------
@@ -60,6 +97,11 @@ async def health_check():
         "ctrip_ready": ctrip_ready,
         "pdf_ready": _weasyprint_available,
         "fliggy_ready": fliggy_flight.is_configured(),
+        "generation": {
+            "capacity": _generation_gate.capacity,
+            "active": _generation_gate.active,
+            "waiting": _generation_gate.waiting,
+        },
     }
 
 
@@ -68,19 +110,29 @@ async def health_check():
 async def generate_guide(request: Request):
     from orchestrator import TravelGuideOrchestrator, LLMClientError
 
-    body = await request.json()
-    query = body.get("query", "").strip()
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="请求内容必须是有效的 JSON")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="请求内容必须是 JSON 对象")
+
+    raw_query = body.get("query", "")
+    if not isinstance(raw_query, str):
+        raise HTTPException(status_code=400, detail="旅行需求必须是文本")
+    query = raw_query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="请输入旅行需求")
-
-    # 前端可传覆盖配置
-    user_config = body.get("config", {}) or {}
+    if len(query) > 2000:
+        raise HTTPException(status_code=400, detail="旅行需求不能超过 2000 字")
 
     try:
+        # 模型地址和密钥只能来自服务器环境变量。绝不接受公网请求覆盖，
+        # 否则攻击者可把服务端 API Key 转发到其控制的地址。
         orchestrator = TravelGuideOrchestrator(
-            base_url=user_config.get("base_url") or llm_config.base_url,
-            api_key=user_config.get("api_key") or llm_config.api_key,
-            model=user_config.get("model") or llm_config.model,
+            base_url=llm_config.base_url,
+            api_key=llm_config.api_key,
+            model=llm_config.model,
         )
     except LLMClientError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -91,45 +143,48 @@ async def generate_guide(request: Request):
 
     async def event_stream():
         full_markdown = ""
-        guid = ""
         try:
-            async for event in orchestrator.generate(query):
-                if event["type"] == "content":
-                    full_markdown += event["data"]
-                    # SSE 多行格式：数据含 \n 时拆为多个 data: 行
-                    data = event["data"]
-                    if "\n" in data:
-                        lines = "\n".join(f"data: {line}" for line in data.split("\n"))
-                    else:
-                        lines = f"data: {data}"
-                    yield f"event: content\n{lines}\n\n"
-                elif event["type"] == "progress":
-                    yield f"event: progress\ndata: {_sse_line(event['data'])}\n\n"
-                elif event["type"] == "error":
-                    yield f"event: error\ndata: {_sse_line(event['data'])}\n\n"
+            if _generation_gate.active >= _generation_gate.capacity:
+                yield "event: progress\ndata: 当前生成任务较多，已进入队列等待...\n\n"
+
+            async with _generation_gate.slot():
+                async for event in orchestrator.generate(query):
+                    if event["type"] == "content":
+                        full_markdown += event["data"]
+                        # SSE 多行格式：数据含 \n 时拆为多个 data: 行
+                        data = event["data"]
+                        if "\n" in data:
+                            lines = "\n".join(f"data: {line}" for line in data.split("\n"))
+                        else:
+                            lines = f"data: {data}"
+                        yield f"event: content\n{lines}\n\n"
+                    elif event["type"] == "progress":
+                        yield f"event: progress\ndata: {_sse_line(event['data'])}\n\n"
+                    elif event["type"] == "error":
+                        yield f"event: error\ndata: {_sse_line(event['data'])}\n\n"
+                        return
+
+                if not full_markdown.strip():
+                    yield "event: error\ndata: 模型未返回有效内容，请重试\n\n"
                     return
 
-            # 生成完成后，渲染 HTML
-            # to_html 内含路线图生成（同步串行 HTTP，可达数十秒），必须放线程池，
-            # 否则会阻塞事件循环、卡住其他用户的请求
-            guid = str(uuid.uuid4())[:8]
-            from generator import TravelGuideGenerator
-            gen = TravelGuideGenerator(app_config.templates_dir)
-            html_content = await asyncio.to_thread(gen.to_html, full_markdown, guid)
+                # 使用完整 UUID，避免高并发下 8 位短 ID 碰撞后覆盖其他人的报告。
+                guid = uuid.uuid4().hex
+                from generator import TravelGuideGenerator
+                gen = TravelGuideGenerator(app_config.templates_dir)
+                html_content = await asyncio.to_thread(gen.to_html, full_markdown, guid)
 
-            # 缓存
-            _clean_cache()
-            from services import trip_store
-            trip_store.save_guide(guid, html_content, full_markdown)
+                await _clean_cache()
+                from services import trip_store
+                await asyncio.to_thread(
+                    trip_store.save_guide, guid, html_content, full_markdown
+                )
 
-            # 发送 result 事件
-            import json
-            result_data = json.dumps({
-                "guide_id": guid,
-                "html": html_content,
-            }, ensure_ascii=False)
-            yield f"event: result\ndata: {result_data}\n\n"
-            yield "event: done\ndata: {}\n\n"
+                # 前端通过下载地址加载 HTML，无需在 SSE 中重复传输整份文档。
+                import json
+                result_data = json.dumps({"guide_id": guid}, ensure_ascii=False)
+                yield f"event: result\ndata: {result_data}\n\n"
+                yield "event: done\ndata: {}\n\n"
 
         except Exception as e:
             yield f"event: error\ndata: {_sse_line(e)}\n\n"
@@ -149,8 +204,8 @@ async def generate_guide(request: Request):
 @app.get("/api/download/{guide_id}")
 async def download_guide(guide_id: str, format: str = Query("html")):
     from services import trip_store
-    _clean_cache()
-    guide = trip_store.get_guide(guide_id)
+    await _clean_cache()
+    guide = await asyncio.to_thread(trip_store.get_guide, guide_id)
     if not guide:
         raise HTTPException(status_code=404, detail="攻略已过期或不存在，请重新生成")
 
@@ -160,7 +215,8 @@ async def download_guide(guide_id: str, format: str = Query("html")):
     if format == "pdf":
         try:
             # WeasyPrint 渲染是重 CPU 同步操作，放线程池避免阻塞事件循环
-            pdf_bytes = await asyncio.to_thread(gen.to_pdf, guide["html"], guide_id)
+            async with _export_gate.slot():
+                pdf_bytes = await asyncio.to_thread(gen.to_pdf, guide["html"], guide_id)
             return Response(
                 content=pdf_bytes,
                 media_type="application/pdf",
@@ -170,16 +226,18 @@ async def download_guide(guide_id: str, format: str = Query("html")):
             raise HTTPException(status_code=503, detail=str(e))
 
     elif format == "docx":
-        docx_bytes = await asyncio.to_thread(gen.to_docx, guide["markdown"], guide_id)
+        async with _export_gate.slot():
+            docx_bytes = await asyncio.to_thread(gen.to_docx, guide["markdown"], guide_id)
         return Response(
             content=docx_bytes,
             media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f"attachment; filename=travel-guide-{guide_id}.docx"},
         )
 
-    else:
-        # 默认 HTML
+    elif format == "html":
         return HTMLResponse(content=guide["html"])
+
+    raise HTTPException(status_code=400, detail="format 仅支持 html、pdf 或 docx")
 
 
 # ---------- 行程管理 ----------

@@ -27,9 +27,9 @@ DB_PATH = Path(os.environ["TRIP_STORE_DB_PATH"]) if os.environ.get("TRIP_STORE_D
 
 def _get_db() -> sqlite3.Connection:
     """获取数据库连接"""
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = sqlite3.connect(str(DB_PATH), timeout=30.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
 
@@ -37,6 +37,7 @@ def _get_db() -> sqlite3.Connection:
 def init_db():
     """初始化数据库表"""
     conn = _get_db()
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS trips (
             id TEXT PRIMARY KEY,

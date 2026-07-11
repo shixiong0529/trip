@@ -37,6 +37,14 @@ class AppConfig:
         self.templates_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates")
         self.guide_cache_ttl = int(os.getenv("GUIDE_CACHE_TTL", "86400"))  # 攻略缓存有效期（秒），默认 24 小时
         self.wendao_cache_ttl = int(os.getenv("WENDAO_CACHE_TTL", "43200"))  # 携程问道查询缓存有效期（秒），默认 12 小时
+        # 限制昂贵的长耗时任务，超出的请求在服务端排队，避免多人同时提交时
+        # 打满模型/外部数据接口和线程池。至少保留 1 个并发槽位。
+        self.generation_max_concurrency = max(
+            1, int(os.getenv("GENERATION_MAX_CONCURRENCY", "2"))
+        )
+        self.export_max_concurrency = max(
+            1, int(os.getenv("EXPORT_MAX_CONCURRENCY", "1"))
+        )
 
         # CORS 允许的来源，逗号分隔；未配置时默认仅允许本机同端口访问（本地前端为同源，不受 CORS 影响）
         origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()

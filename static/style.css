@@ -45,6 +45,9 @@ body {
   background: url('/static/pcbg6-desktop.jpg') center 38% / cover no-repeat fixed;
   filter: brightness(0.65);
 }
+.bg-scene.bg-pc-macbook {
+  background-image: url('/static/macbook-bg-desktop.jpg');
+}
 
 /* ---------- 悬浮药丸导航 ---------- */
 .app-header {

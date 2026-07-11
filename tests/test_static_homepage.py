@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_homepage_uses_clear_background_and_note_footer():
     index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
     css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    background_js = (ROOT / "static" / "background.js").read_text(encoding="utf-8")
 
     assert "AI AGENT · 实时数据 · 三格式导出" not in index
     assert "AI AGENT · 实时数据" in index
@@ -24,7 +25,11 @@ def test_homepage_uses_clear_background_and_note_footer():
     assert 'href="/info#contact"' in index
     assert "bg-veil" not in index
     assert ".bg-veil" not in css
-    assert css.count("url('/static/bg.jpg')") == 1
+    assert "url('/static/pcbg6-desktop.jpg')" in css
+    assert "url('/static/macbook-bg-desktop.jpg')" in css
+    assert "url('/static/mbbg1-mobile.jpg')" in css
+    assert "Math.random() < 0.5" in background_js
+    assert "bg-pc-macbook" in background_js
     assert "backdrop-filter:" not in css
     assert "-webkit-backdrop-filter:" not in css
     bg_scene_rule = re.search(r"\.bg-scene\s*\{(?P<body>.*?)\}", css, re.S)
@@ -43,6 +48,15 @@ def test_homepage_script_tolerates_removed_status_bar():
     assert 'id="status-bar"' not in index
     assert "if (els.statusDot && els.statusText)" in app_js
     assert "if (els.statusBar)" in app_js
+
+
+def test_generation_frontend_isolates_cancelled_requests():
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "generationRunId" in app_js
+    assert "if (state.mode === 'generating') return" in app_js
+    assert "const body = { query: query }" in app_js
+    assert "state.config" not in app_js
 
 
 def test_homepage_uses_logo_image_as_nav_icon_only():

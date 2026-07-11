@@ -44,11 +44,37 @@ def test_generate_empty_query_returns_400():
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize(
+    ("body", "content_type"),
+    [
+        ("{not-json", "application/json"),
+        ("[]", "application/json"),
+        ('{"query": 123}', "application/json"),
+    ],
+)
+def test_generate_rejects_invalid_request_bodies(body, content_type):
+    resp = client.post(
+        "/api/generate", content=body, headers={"Content-Type": content_type}
+    )
+    assert resp.status_code == 400
+
+
+def test_generate_rejects_query_over_2000_characters():
+    resp = client.post("/api/generate", json={"query": "旅" * 2001})
+    assert resp.status_code == 400
+
+
 # ---------- 下载 ----------
 
 def test_download_missing_guide_returns_404():
     resp = client.get("/api/download/does-not-exist")
     assert resp.status_code == 404
+
+
+def test_download_rejects_unknown_format(isolated_db):
+    isolated_db.save_guide("format-test", "<html>ok</html>", "# ok")
+    resp = client.get("/api/download/format-test?format=zip")
+    assert resp.status_code == 400
 
 
 # ---------- 行程管理 ----------

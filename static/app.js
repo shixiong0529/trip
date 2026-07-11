@@ -44,21 +44,14 @@
     guideMarkdown: null,
     progressSteps: [],
     abortController: null,
+    generationRunId: 0,
     pdfReady: true,      // 由 /api/health 的 pdf_ready 更新，决定 PDF 下载按钮是否可用
-    config: {
-      base_url: '',
-      api_key: '',
-      model: '',
-    },
   };
 
-  // ====== 配置管理（配置 UI 已移除，仍兼容读取历史保存的浏览器端配置） ======
-  function loadConfig() {
+  // 旧版本曾把 API Key 保存在浏览器中；现在统一使用服务端配置并清理遗留敏感数据。
+  function clearLegacyConfig() {
     try {
-      const saved = localStorage.getItem('travel_guide_config');
-      if (saved) {
-        state.config = { ...state.config, ...JSON.parse(saved) };
-      }
+      localStorage.removeItem('travel_guide_config');
     } catch (e) { /* ignore */ }
   }
 
@@ -68,18 +61,14 @@
       const res = await fetch('/api/health');
       const data = await res.json();
       const hasServerKey = data.llm_configured;
-      const hasLocalKey = !!state.config.api_key;
-      const hasKey = hasServerKey || hasLocalKey;
 
       state.pdfReady = data.pdf_ready !== false;
       updatePdfButtonState();
 
       if (els.statusDot && els.statusText) {
-        if (hasKey) {
+        if (hasServerKey) {
           els.statusDot.className = 'status-dot connected';
-          els.statusText.textContent = hasServerKey
-            ? 'LLM 已配置（服务端 API Key）'
-            : 'LLM 已配置（浏览器 API Key）';
+          els.statusText.textContent = 'LLM 已配置（服务端 API Key）';
         } else {
           els.statusDot.className = 'status-dot disconnected';
           els.statusText.textContent = '未配置 API Key，请在服务端 .env 中设置 LLM_API_KEY';
@@ -147,6 +136,8 @@
 
   // ====== 生成攻略 ======
   async function startGeneration() {
+    if (state.mode === 'generating') return;
+
     const query = els.queryInput.value.trim();
     if (!query) {
       showToast('请输入旅行需求', 'error');
@@ -160,24 +151,21 @@
     state.guideHtml = null;
     state.guideId = null;
     state.progressSteps = [];
-    state.abortController = new AbortController();
+    const runId = ++state.generationRunId;
+    const controller = new AbortController();
+    state.abortController = controller;
 
-    const body = {
-      query: query,
-      config: {
-        base_url: state.config.base_url || undefined,
-        api_key: state.config.api_key || undefined,
-        model: state.config.model || undefined,
-      },
-    };
+    const body = { query: query };
 
     try {
       const res = await fetch('/api/generate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
-        signal: state.abortController.signal,
+        signal: controller.signal,
       });
+
+      if (runId !== state.generationRunId) return;
 
       if (!res.ok) {
         const errText = await res.text();
@@ -195,6 +183,11 @@
 
       // 按 SSE 规范：一个事件可含多个 data: 行（对应内容中的换行），空行表示事件结束
       function dispatchEvent() {
+        if (runId !== state.generationRunId) {
+          currentEvent = '';
+          dataLines = [];
+          return;
+        }
         if (dataLines.length === 0 && !currentEvent) return;
         const payload = dataLines.join('\n');
 
@@ -210,7 +203,7 @@
           try {
             const result = JSON.parse(payload);
             state.guideId = result.guide_id;
-            state.guideHtml = result.html;
+            state.guideHtml = result.html || null;
           } catch (e) { /* ignore */ }
         } else if (currentEvent === 'error') {
           showToast(payload, 'error');
@@ -250,13 +243,17 @@
       dispatchEvent();
 
       // 生成完成
-      if (state.guideHtml && state.guideId) {
+      if (runId !== state.generationRunId) return;
+      state.abortController = null;
+      if (state.guideId) {
         renderGuide();
       } else {
         showToast('生成未返回有效结果', 'error');
         setMode('idle');
       }
     } catch (e) {
+      if (runId !== state.generationRunId) return;
+      state.abortController = null;
       if (e.name === 'AbortError') {
         setMode('idle');
         return;
@@ -337,6 +334,8 @@
     if (state.abortController) {
       state.abortController.abort();
     }
+    state.abortController = null;
+    state.generationRunId += 1;
     setMode('idle');
     showToast('已取消生成', 'info');
   });
@@ -465,7 +464,7 @@
 
   // ====== 初始化 ======
   function init() {
-    loadConfig();
+    clearLegacyConfig();
     checkHealth();
     setMode('idle');
 
