@@ -143,7 +143,10 @@ def test_report_table_labels_do_not_break_across_lines(gen):
         "| 经济型 | 测试酒店 |\n",
         "nowrap",
     )
-    assert "word-break: keep-all;" in html
+    # 表头/首列不断行由 white-space: nowrap 保证;
+    # 不再用 word-break: keep-all——它会让中文长明细无法折行,
+    # 把预算表的人均/合计列挤出可视区(看起来像没有数据)
+    assert "word-break: keep-all" not in html
     assert "white-space: nowrap;" in html
     assert "min-width: 88px;" in html
 

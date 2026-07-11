@@ -70,3 +70,12 @@ def test_info_page_contains_four_link_targets_and_contact_email():
     assert 'href="/info#data-source"' in info
     assert 'class="info-page"' in info
     assert ".info-page" in css
+
+
+def test_guide_template_allows_cjk_wrap_in_tables():
+    """回归:模板表格曾用 word-break: keep-all,中文长明细不折行,
+    把预算表的人均/合计列挤出可视区,看起来像没有数据。
+    """
+    guide = (ROOT / "templates" / "guide.html").read_text(encoding="utf-8")
+    assert "word-break: keep-all" not in guide
+    assert "overflow-wrap: break-word" in guide

@@ -258,7 +258,10 @@
     width: 100%;
     border-collapse: collapse;
     font-size: .88rem;
-    word-break: keep-all;
+    /* 不用 keep-all：它禁止中文字间断行，"塔尔寺70+青海湖100+…"这类
+       无空格长明细会把列撑到视口外，导致人均/合计列"消失" */
+    word-break: normal;
+    overflow-wrap: break-word;
   }
   th {
     background: var(--muted-surface);
