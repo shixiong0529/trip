@@ -42,7 +42,7 @@ body {
   position: fixed;
   inset: 0;
   z-index: -2;
-  background: url('/static/pcbg1-desktop.jpg') center 38% / cover no-repeat fixed;
+  background: url('/static/pcbg2-desktop.jpg') center 38% / cover no-repeat fixed;
 }
 
 /* ---------- 悬浮药丸导航 ---------- */
