@@ -330,11 +330,23 @@ body {
   gap: 12px;
   margin-bottom: 18px;
 }
-.generating-header h3 {
+.generating-title {
   flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.generating-header h3 {
   font-size: 1.1em;
   font-weight: 800;
   color: var(--ink);
+}
+.generating-note {
+  color: #d92d20;
+  font-size: 0.88em;
+  font-weight: 900;
+  white-space: nowrap;
 }
 .pulse-dot {
   width: 12px;
@@ -348,9 +360,11 @@ body {
   50% { box-shadow: 0 0 0 12px rgba(255, 122, 69, 0); }
 }
 .stream-output {
-  background: rgba(16, 24, 40, 0.92);
-  color: #d7e3f4;
+  background: rgba(238, 244, 251, 0.74);
+  color: #233044;
+  border: 1px solid rgba(255, 255, 255, 0.58);
   border-radius: var(--radius-lg);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
   padding: 20px 22px;
   min-height: 300px;
   max-height: 56vh;
@@ -738,7 +752,17 @@ body {
   .panel { padding: 20px 16px; }
 
   /* ---- 生成中 ---- */
+  .generating-header {
+    flex-wrap: wrap;
+  }
+  .generating-title {
+    flex-wrap: wrap;
+    gap: 4px 10px;
+  }
   .generating-header h3 { font-size: 1.02em; }
+  .generating-note {
+    font-size: 0.84em;
+  }
   .stream-output { padding: 16px 16px; max-height: 60vh; }
 
   /* ---- 结果页工具栏：徽章一行 + 按钮网格，宽度统一好点按 ---- */
