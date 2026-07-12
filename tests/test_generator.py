@@ -117,7 +117,7 @@ def test_h1_followed_by_plain_paragraph_is_preserved():
     assert "这是一段没有统计数字的普通说明文字" in html
 
 
-def test_intro_stats_render_as_report_cards(gen):
+def test_intro_stats_are_not_rendered_as_report_cards(gen):
     md = (
         "# 🗺️ 北京4日游\n\n"
         "4天1人，人均预算 ¥2,550，核心景点 8 个\n\n"
@@ -127,12 +127,11 @@ def test_intro_stats_render_as_report_cards(gen):
         "| 去程 | 高铁 |\n"
     )
     html = gen.to_html(md, "no-stats")
-    assert 'class="stats-grid"' in html
-    assert html.count('class="stat-card"') == 4
-    assert "旅行天数" in html
-    assert "出行人数" in html
-    assert "人均预算" in html
-    assert "4天1人，人均预算" not in html
+    assert 'class="stats-grid"' not in html
+    assert 'class="stat-card"' not in html
+    assert "旅行天数" not in html
+    assert "出行人数" not in html
+    assert "人均预算" not in html
 
 
 def test_report_table_labels_do_not_break_across_lines(gen):
@@ -300,6 +299,30 @@ def test_overview_keeps_route_and_tip_when_model_omits_blank_lines():
     assert "上海 → 成都 → 上海" in html
     assert "午后注意避暑" in html
     assert "3天2人" not in html
+
+
+def test_overview_removes_orphan_markdown_and_keeps_required_order():
+    md = (
+        "# 🗺️ 青甘12日游\n\n"
+        "12天2人，总里程2,800km，人均预算¥8,800\n"
+        "** \n"
+        "** 路线总览：** 西安 → 西宁 → 敦煌 → 西安 **\n"
+        "** \n"
+        "** 重要提示 **： 高原自驾需轮换驾驶。 **\n\n"
+        "## 🌤️ 天气与穿搭\n天气内容\n"
+    )
+
+    html = _blocks_to_html_fragment(_parse_markdown_to_blocks(md))
+
+    assert 'class="stats-grid"' not in html
+    assert "2,800km" not in html
+    assert "<p>**</p>" not in html
+    assert "重要提示**" not in html
+    route_index = html.index('class="route-overview-card"')
+    tip_index = html.index('class="important-note-card"')
+    section_index = html.index('class="section"')
+    assert route_index < tip_index < section_index
+    assert "<strong>重要提示：</strong>高原自驾需轮换驾驶。" in html
 
 
 def test_rendered_table_cells_include_mobile_labels(gen):

@@ -80,7 +80,13 @@ def normalize_route_overview(content: str) -> str:
     """将路线总览规范为只包含城市、城镇和景点节点的单行路线。"""
     nodes = _extract_route_overview_nodes(content)
     if len(nodes) < 2:
-        return content
+        detail = re.sub(
+            r"^\s*\*\*?\s*(?:路线(?:总览|纵览)|线路(?:总览|纵览))"
+            r"\s*\*\*?\s*[:：]?\s*",
+            "",
+            content,
+        ).strip().strip("*").strip()
+        return "**路线总览：** " + detail
     return "**路线总览：** " + " → ".join(nodes)
 
 
@@ -296,13 +302,17 @@ def extract_route_nodes(markdown_content: str) -> list[str]:
 def _extract_route_overview_nodes(markdown_content: str) -> list[str]:
     nodes: list[str] = []
     for line in markdown_content.splitlines():
-        if not re.search(r"路线总览|线路(?:总览|纵览)", line):
+        if not re.search(r"路线(?:总览|纵览)|线路(?:总览|纵览)", line):
             continue
         text = re.sub(r"^\s*[-+]\s*", "", line)
         text = re.sub(
-            r"\*\*(?:路线总览|线路(?:总览|纵览))\*\*\s*[:：]?", "", text
+            r"\*\*\s*(?:路线(?:总览|纵览)|线路(?:总览|纵览))\s*\*\*\s*[:：]?",
+            "",
+            text,
         )
-        text = re.sub(r"(?:路线总览|线路(?:总览|纵览))\s*[:：]?", "", text)
+        text = re.sub(
+            r"(?:路线(?:总览|纵览)|线路(?:总览|纵览))\s*[:：]?", "", text
+        )
         parts = re.split(r"(?:→|->|⇒|➡️|➡)", text)
         for part in parts:
             part = re.sub(r"[✈️🚄🚗🚇🚌🚕🏁]+", " ", part)

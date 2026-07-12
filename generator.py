@@ -185,10 +185,11 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
         if t == "h1":
             html += _render_hero(content)
             in_container = True
-            # 接下来的 1-3 个段落通常是概览统计 + 路线总览 + 重要提示
+            # H1 后到第一个章节之间是概览区。模型偶尔会把加粗标记拆成
+            # 独立段落，因此不限制段落数量，再由 _render_overview 过滤。
             overview_paras = []
             j = i + 1
-            while j < len(blocks) and blocks[j]["type"] == "p" and len(overview_paras) < 3:
+            while j < len(blocks) and blocks[j]["type"] == "p":
                 overview_paras.append(blocks[j]["content"])
                 j += 1
             if overview_paras:
@@ -293,55 +294,67 @@ def _is_route_map_section(title: str) -> bool:
 
 
 def _render_overview(paras: list[str]) -> str:
-    """渲染概览区：跳过开头统计句，保留路线总览 + 重要提示。
+    """渲染概览区：只保留路线总览 + 重要提示。
 
     模型不一定会在三段概览之间输出空行。解析器会把相邻行合并成一个
-    paragraph，因此这里按语义标签再次切分，避免丢弃统计句时把后面的
-    路线和提示一起丢掉。
+    paragraph，也可能在 ``**`` 和标题之间插入空格。这里按语义标签再次
+    切分并过滤孤立 Markdown 标记，避免开头出现空白卡片或裸星号。
     """
-    html = ""
-
-    segments = []
+    segments: list[str] = []
     overview_label = re.compile(
-        r"(?=(?:\*\*)?(?:路线总览|线路(?:总览|纵览)|重要提示)(?:\*\*)?\s*[:：]?)"
+        r"(?=(?:\*\*\s*)?(?:路线总览|路线纵览|线路(?:总览|纵览))"
+        r"|(?:\*\*\s*)?重要提示)"
     )
     for paragraph in paras:
         segments.extend(
             part.strip()
             for part in overview_label.split(paragraph)
-            if part.strip()
+            if part.strip() and not re.fullmatch(r"[*_\s]+", part)
         )
 
-    # 将模型开头的统计句转成易扫读的统计卡片，不显示原始长句。
-    if segments and len(_extract_stats(segments[0])) >= 2:
-        html += _render_stats_grid(_extract_stats(segments[0]))
-        segments = segments[1:]
-
-    for p in segments:
-        html += _render_paragraph_card(p)
-
-    return html
-
-
-def _render_stats_grid(stats: list[tuple[str, str]]) -> str:
-    """将关键统计渲染为参考报告风格的紧凑卡片。"""
-    cards = "".join(
-        '<div class="stat-card">'
-        f'<div class="stat-value">{_inline_md(value)}</div>'
-        f'<div class="stat-label">{_inline_md(label)}</div>'
-        '</div>'
-        for label, value in stats
+    route = next(
+        (part for part in segments if re.search(r"路线(?:总览|纵览)|线路(?:总览|纵览)", part)),
+        None,
     )
-    return f'<div class="stats-grid">{cards}</div>\n'
+    important = next((part for part in segments if "重要提示" in part), None)
+
+    # 兼容极简 Markdown：完全没有规范概览标签时，保留普通开场说明。
+    if not route and not important:
+        return "".join(
+            _render_paragraph_card(part)
+            for part in segments
+            if len(_extract_stats(part)) < 2
+        )
+
+    html = _render_route_overview_card(route) if route else ""
+    html += _render_important_note_card(important) if important else ""
+    return html
 
 
 def _render_paragraph_card(content: str) -> str:
     """根据段落语义渲染重点卡片。"""
-    if re.search(r"路线总览|线路(?:总览|纵览)", content):
-        return f'<div class="route-overview-card"><p>{_inline_md(normalize_route_overview(content))}</p></div>\n'
+    if re.search(r"路线(?:总览|纵览)|线路(?:总览|纵览)", content):
+        return _render_route_overview_card(content)
     if "重要提示" in content:
-        return f'<div class="important-note-card"><p>{_inline_md(content)}</p></div>\n'
+        return _render_important_note_card(content)
     return f'<div class="card"><p>{_inline_md(content)}</p></div>\n'
+
+
+def _render_route_overview_card(content: str) -> str:
+    normalized = normalize_route_overview(content)
+    return f'<div class="route-overview-card"><p>{_inline_md(normalized)}</p></div>\n'
+
+
+def _render_important_note_card(content: str) -> str:
+    """规范重要提示标签，清除模型输出中错位的 Markdown 星号。"""
+    detail = re.sub(
+        r"^\s*\*\*?\s*重要提示\s*\*\*?\s*[:：]?\s*", "", content
+    )
+    detail = re.sub(r"^\s*重要提示\s*\*{0,2}\s*[:：]?\s*", "", detail)
+    detail = detail.strip().strip("*").strip()
+    label = '<strong>重要提示：</strong>'
+    text = f"{label}{_inline_md(detail)}" if detail else label
+    return f'<div class="important-note-card"><p>{text}</p></div>\n'
 
 
 def _extract_stats(text: str) -> list[tuple[str, str]]:

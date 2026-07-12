@@ -109,3 +109,5 @@ def test_guide_template_has_no_hero_tag_styles():
 
     assert ".hero .tags" not in guide
     assert ".hero .tag" not in guide
+    assert ".stats-grid" not in guide
+    assert ".stat-card" not in guide
