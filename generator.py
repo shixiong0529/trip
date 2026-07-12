@@ -718,16 +718,29 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
 
 def _render_hero(title: str) -> str:
     """渲染 Hero 区"""
-    clean_title = re.sub(
-        r"^(?:🗺️?|🚗|🚙|✈️?|🚄|🚆|🌍|📍)\s*", "", title.strip()
-    )
-    display_title = f"🚗 {clean_title or title.strip()}"
+    clean_title = _clean_hero_title(title)
+    display_title = clean_title or title.strip()
     return f'''<div class="container">
 <div class="hero">
   <h1>{_inline_md(display_title)}</h1>
   <p class="meta">AI 旅行管家 · 路小仙（Leo）定制</p>
 </div>
 '''
+
+
+def _clean_hero_title(title: str) -> str:
+    """移除模型偶尔加在报告主标题前的 Markdown 包裹和旅行图标。"""
+    clean = title.strip()
+    clean = re.sub(r"^(?:[*_`~]+)\s*", "", clean)
+    clean = re.sub(r"\s*(?:[*_`~]+)$", "", clean)
+    clean = re.sub(
+        r"^(?:🗺️?|🚗|🚙|🚕|🚄|🚆|✈️?|🚌|🚇|🌍|📍|🏖️?|🏔️?|🧳|🏁)\s*",
+        "",
+        clean,
+    )
+    clean = re.sub(r"^(?:[*_`~]+)\s*", "", clean)
+    clean = re.sub(r"\s*(?:[*_`~]+)$", "", clean)
+    return clean.strip()
 
 
 def _is_route_map_section(title: str) -> bool:

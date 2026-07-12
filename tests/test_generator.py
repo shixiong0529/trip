@@ -411,7 +411,7 @@ def test_to_html_has_hero_and_balanced_divs(gen):
 def test_hero_has_no_opening_tags(gen):
     html = gen.to_html("# 🗺️ 成都3日游\n", "no-hero-tags")
 
-    assert "<h1>🚗 成都3日游</h1>" in html
+    assert "<h1>成都3日游</h1>" in html
     assert "<title>🗺️ 成都3日游</title>" in html
     assert '<div class="tags">' not in html
     assert '<span class="tag">' not in html
@@ -419,11 +419,21 @@ def test_hero_has_no_opening_tags(gen):
     assert "可执行行程" not in html
 
 
-def test_hero_replaces_other_travel_icons_with_car(gen):
+def test_hero_removes_other_travel_icons(gen):
     for icon in ("✈️", "🚄", "📍", "🚙"):
-        html = gen.to_html(f"# {icon} 上海周末游\n", "hero-car")
-        assert "<h1>🚗 上海周末游</h1>" in html
-        assert f"<h1>🚗 {icon}" not in html
+        html = gen.to_html(f"# {icon} 上海周末游\n", "hero-no-icon")
+        assert "<h1>上海周末游</h1>" in html
+        assert f"<h1>{icon}" not in html
+
+
+def test_hero_removes_bold_wrapped_travel_icon(gen):
+    html = gen.to_html("# **🗺️ 成都4日美食漫游记 · 为1人定制**\n", "bold-hero-no-icon")
+    start = html.index("<h1>")
+    end = html.index("</h1>", start) + len("</h1>")
+    hero_title = html[start:end]
+
+    assert hero_title == "<h1>成都4日美食漫游记 · 为1人定制</h1>"
+    assert "🗺️ 成都4日美食漫游记" not in hero_title
 
 
 def test_to_html_does_not_insert_route_map(gen):
