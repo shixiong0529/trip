@@ -527,6 +527,21 @@ def test_rendered_table_cells_include_mobile_labels(gen):
     assert '<td data-label="提示">提前购票</td>' in html
 
 
+def test_total_budget_table_gets_mobile_specific_wrapper(gen):
+    html = gen.to_html(
+        "# 测试\n\n## 💰 总预算拆解\n"
+        "| 类别 | 明细 | 人均 | 合计（2人） |\n"
+        "|---|---|---|---|\n"
+        "| 住宿 | 2晚 | ¥300 | ¥600 |\n"
+        "| **总计** | | **¥300** | **¥600** |\n",
+        "mobile-budget",
+    )
+
+    assert 'class="table-wrapper budget-table-wrapper"' in html
+    assert "¥300" in html
+    assert "¥600" in html
+
+
 def test_route_overview_card_removes_road_nodes():
     md = (
         "# 🗺️ 川藏行程\n\n"

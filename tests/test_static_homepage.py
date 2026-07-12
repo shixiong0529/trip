@@ -104,6 +104,9 @@ def test_guide_template_keeps_pc_table_structure_on_mobile():
     assert ".kv-table-wrapper table { min-width: 0; }" in mobile
     assert ".table-wrapper tbody { display: block" not in mobile
     assert "content: attr(data-label)" not in mobile
+    assert ".budget-table-wrapper { overflow-x: visible; }" in mobile
+    assert ".budget-table-wrapper table" in mobile
+    assert "table-layout: fixed" in mobile
 
 
 def test_guide_template_has_no_hero_tag_styles():

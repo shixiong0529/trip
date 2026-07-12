@@ -427,6 +427,31 @@
       width: 86px;
       min-width: 86px;
     }
+    /* 总预算金额必须首屏可见，不放进宽表的横向滚动区域。 */
+    .budget-table-wrapper { overflow-x: visible; }
+    .budget-table-wrapper table {
+      min-width: 0;
+      table-layout: fixed;
+      font-size: .72rem;
+    }
+    .budget-table-wrapper th,
+    .budget-table-wrapper td {
+      min-width: 0;
+      padding: 8px 4px;
+      overflow-wrap: anywhere;
+    }
+    .budget-table-wrapper th:nth-child(1),
+    .budget-table-wrapper td:nth-child(1) { width: 18%; }
+    .budget-table-wrapper th:nth-child(2),
+    .budget-table-wrapper td:nth-child(2) { width: 38%; }
+    .budget-table-wrapper th:nth-child(3),
+    .budget-table-wrapper td:nth-child(3),
+    .budget-table-wrapper th:nth-child(4),
+    .budget-table-wrapper td:nth-child(4) {
+      width: 22%;
+      white-space: nowrap;
+      text-align: right;
+    }
   }
 </style>
 </head>

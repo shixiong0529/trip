@@ -914,7 +914,16 @@ def _render_table(rows: list[list[str]]) -> str:
             cells.append(f'<td data-label="{label}">{_inline_md(cell)}</td>')
         trs += "<tr>" + "".join(cells) + "</tr>"
     wrapper_class = "table-wrapper"
-    if len(rows[0]) == 2:
+    plain_headers = [_strip_inline_md(header) for header in headers]
+    if (
+        len(headers) == 4
+        and "类别" in plain_headers[0]
+        and "明细" in plain_headers[1]
+        and "人均" in plain_headers[2]
+        and re.search(r"合计|总计", plain_headers[3])
+    ):
+        wrapper_class += " budget-table-wrapper"
+    elif len(rows[0]) == 2:
         wrapper_class += " kv-table-wrapper"
     return f'<div class="{wrapper_class}"><table><thead>{th}</thead><tbody>{trs}</tbody></table></div>\n'
 
