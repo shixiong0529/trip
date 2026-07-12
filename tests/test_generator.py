@@ -273,6 +273,40 @@ def test_overview_route_and_important_tip_use_emphasis_classes():
     assert "上海 → 成都 → 上海" in html
 
 
+def test_overview_keeps_route_and_tip_when_model_omits_blank_lines():
+    md = (
+        "# 🗺️ 成都3日游\n\n"
+        "3天2人，人均预算 ¥2,000，核心景点 6 个\n"
+        "**线路纵览：** 上海 → 成都 → 上海。\n"
+        "**重要提示：** 午后注意避暑。\n\n"
+        "## 🌤️ 天气与穿搭\n"
+        "天气内容\n"
+    )
+
+    html = _blocks_to_html_fragment(_parse_markdown_to_blocks(md))
+
+    assert 'class="route-overview-card"' in html
+    assert 'class="important-note-card"' in html
+    assert "上海 → 成都 → 上海" in html
+    assert "午后注意避暑" in html
+    assert "3天2人" not in html
+
+
+def test_rendered_table_cells_include_mobile_labels(gen):
+    html = gen.to_html(
+        "# 🗺️ 测试\n\n"
+        "## 🚄 城际交通建议\n"
+        "| 方向 | 推荐方式 | 提示 |\n"
+        "|------|---------|------|\n"
+        "| 去程 | 高铁 | 提前购票 |\n",
+        "mobile-table-labels",
+    )
+
+    assert '<td data-label="方向">去程</td>' in html
+    assert '<td data-label="推荐方式">高铁</td>' in html
+    assert '<td data-label="提示">提前购票</td>' in html
+
+
 def test_route_overview_card_removes_road_nodes():
     md = (
         "# 🗺️ 川藏行程\n\n"

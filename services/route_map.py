@@ -296,11 +296,13 @@ def extract_route_nodes(markdown_content: str) -> list[str]:
 def _extract_route_overview_nodes(markdown_content: str) -> list[str]:
     nodes: list[str] = []
     for line in markdown_content.splitlines():
-        if "路线总览" not in line:
+        if not re.search(r"路线总览|线路(?:总览|纵览)", line):
             continue
         text = re.sub(r"^\s*[-+]\s*", "", line)
-        text = re.sub(r"\*\*路线总览\*\*\s*[:：]?", "", text)
-        text = re.sub(r"路线总览\s*[:：]?", "", text)
+        text = re.sub(
+            r"\*\*(?:路线总览|线路(?:总览|纵览))\*\*\s*[:：]?", "", text
+        )
+        text = re.sub(r"(?:路线总览|线路(?:总览|纵览))\s*[:：]?", "", text)
         parts = re.split(r"(?:→|->|⇒|➡️|➡)", text)
         for part in parts:
             part = re.sub(r"[✈️🚄🚗🚇🚌🚕🏁]+", " ", part)

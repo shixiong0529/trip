@@ -113,6 +113,31 @@ def test_view_trip_200_and_404():
     assert missing.status_code == 404
 
 
+def test_view_trip_preserves_compact_overview_and_mobile_table_labels():
+    markdown = (
+        "# 🗺️ 成都3日游\n\n"
+        "3天2人，人均预算 ¥2,000，核心景点 6 个\n"
+        "**线路纵览：** 上海 → 成都 → 上海。\n"
+        "**重要提示：** 午后注意避暑。\n\n"
+        "## 🚄 城际交通建议\n"
+        "| 方向 | 推荐方式 | 提示 |\n"
+        "|------|---------|------|\n"
+        "| 去程 | 高铁 | 提前购票 |\n"
+    )
+    saved = client.post(
+        "/api/trips", json={"destination": "成都", "markdown": markdown}
+    )
+
+    view = client.get(f"/api/trips/{saved.json()['trip_id']}/view")
+
+    assert view.status_code == 200
+    assert 'class="route-overview-card"' in view.text
+    assert 'class="important-note-card"' in view.text
+    assert "上海 → 成都 → 上海" in view.text
+    assert "午后注意避暑" in view.text
+    assert '<td data-label="提示">提前购票</td>' in view.text
+
+
 def test_delete_trip_404_for_missing():
     resp = client.delete("/api/trips/does-not-exist")
     assert resp.status_code == 404

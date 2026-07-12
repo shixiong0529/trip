@@ -93,3 +93,12 @@ def test_guide_template_allows_cjk_wrap_in_tables():
     guide = (ROOT / "templates" / "guide.html").read_text(encoding="utf-8")
     assert "word-break: keep-all" not in guide
     assert "overflow-wrap: break-word" in guide
+
+
+def test_guide_template_turns_mobile_tables_into_labeled_cards():
+    guide = (ROOT / "templates" / "guide.html").read_text(encoding="utf-8")
+
+    assert ".table-wrapper tbody tr" in guide
+    assert ".table-wrapper tbody td::before" in guide
+    assert "content: attr(data-label)" in guide
+    assert "grid-template-columns: minmax(76px, 28%) minmax(0, 1fr)" in guide

@@ -297,16 +297,30 @@ def _is_route_map_section(title: str) -> bool:
 
 
 def _render_overview(paras: list[str]) -> str:
-    """渲染概览区：跳过开头统计句，保留路线总览 + 重要提示"""
+    """渲染概览区：跳过开头统计句，保留路线总览 + 重要提示。
+
+    模型不一定会在三段概览之间输出空行。解析器会把相邻行合并成一个
+    paragraph，因此这里按语义标签再次切分，避免丢弃统计句时把后面的
+    路线和提示一起丢掉。
+    """
     html = ""
 
-    # 首段若是"4天1人，人均预算..."这类统计句，不再渲染为报告开头卡片。
-    stats = _extract_stats(paras[0]) if paras else []
-    rest = paras[1:]
-    if len(stats) < 2:
-        rest = paras
+    segments = []
+    overview_label = re.compile(
+        r"(?=(?:\*\*)?(?:路线总览|线路(?:总览|纵览)|重要提示)(?:\*\*)?\s*[:：]?)"
+    )
+    for paragraph in paras:
+        segments.extend(
+            part.strip()
+            for part in overview_label.split(paragraph)
+            if part.strip()
+        )
 
-    for p in rest:
+    # "4天1人，人均预算..."只用于报告元数据，不重复渲染成普通卡片。
+    if segments and len(_extract_stats(segments[0])) >= 2:
+        segments = segments[1:]
+
+    for p in segments:
         html += _render_paragraph_card(p)
 
     return html
@@ -314,7 +328,7 @@ def _render_overview(paras: list[str]) -> str:
 
 def _render_paragraph_card(content: str) -> str:
     """根据段落语义渲染重点卡片。"""
-    if "路线总览" in content:
+    if re.search(r"路线总览|线路(?:总览|纵览)", content):
         return f'<div class="route-overview-card"><p>{_inline_md(normalize_route_overview(content))}</p></div>\n'
     if "重要提示" in content:
         return f'<div class="important-note-card"><p>{_inline_md(content)}</p></div>\n'
@@ -429,10 +443,15 @@ def _render_table(rows: list[list[str]]) -> str:
     """渲染表格"""
     if not rows:
         return ""
-    th = "<tr>" + "".join(f"<th>{_inline_md(c)}</th>" for c in rows[0]) + "</tr>"
+    headers = rows[0]
+    th = "<tr>" + "".join(f"<th>{_inline_md(c)}</th>" for c in headers) + "</tr>"
     trs = ""
     for row in rows[1:]:
-        trs += "<tr>" + "".join(f"<td>{_inline_md(c)}</td>" for c in row) + "</tr>"
+        cells = []
+        for index, cell in enumerate(row):
+            label = _escape_html(_strip_inline_md(headers[index])) if index < len(headers) else ""
+            cells.append(f'<td data-label="{label}">{_inline_md(cell)}</td>')
+        trs += "<tr>" + "".join(cells) + "</tr>"
     wrapper_class = "table-wrapper"
     if len(rows[0]) == 2:
         wrapper_class += " kv-table-wrapper"

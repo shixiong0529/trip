@@ -91,6 +91,16 @@ def test_extract_route_items_only_uses_route_overview_and_skips_road_nodes():
     ]
 
 
+def test_extract_route_items_accepts_line_overview_alias():
+    md = "**线路纵览：** 上海 → 成都 → 上海。"
+
+    assert route_map.extract_route_items(md) == [
+        {"name": "上海", "day": "第1站"},
+        {"name": "成都", "day": "第2站"},
+        {"name": "上海", "day": "第3站"},
+    ]
+
+
 def test_normalize_route_overview_removes_road_names_and_distance_copy():
     content = "**路线总览**：武汉 → G42沪蓉高速 → 成都 → G318川藏南线 → 拉萨，全程约2,300km。"
 
