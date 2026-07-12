@@ -170,8 +170,8 @@ async def generate_guide(request: Request):
 
                 # 使用完整 UUID，避免高并发下 8 位短 ID 碰撞后覆盖其他人的报告。
                 guid = uuid.uuid4().hex
-                from generator import TravelGuideGenerator, correct_daily_budget_totals
-                full_markdown = correct_daily_budget_totals(full_markdown)
+                from generator import TravelGuideGenerator, normalize_report_markdown
+                full_markdown = normalize_report_markdown(full_markdown)
                 gen = TravelGuideGenerator(app_config.templates_dir)
                 html_content = await asyncio.to_thread(gen.to_html, full_markdown, guid)
 
@@ -259,8 +259,8 @@ async def save_trip(request: Request):
     from services import trip_store
     body = await request.json()
     markdown = body.get("markdown", "")
-    from generator import correct_daily_budget_totals
-    markdown = correct_daily_budget_totals(markdown)
+    from generator import normalize_report_markdown
+    markdown = normalize_report_markdown(markdown)
     raw_destination = body.get("destination", "")
 
     destination = raw_destination

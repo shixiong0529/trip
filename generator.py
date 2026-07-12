@@ -25,6 +25,67 @@ from services.route_map import normalize_route_overview
 logger = logging.getLogger(__name__)
 
 
+_SECTION_ORDER = (
+    "weather", "transport", "lodging", "itinerary", "budget",
+    "booking", "pitfalls", "outbound", "packing", "knowledge",
+)
+_REQUIRED_SECTIONS = set(_SECTION_ORDER) - {"outbound"}
+_SECTION_TITLES = {
+    "weather": "🌤️ 天气与穿搭",
+    "transport": "🚄 城际交通建议",
+    "lodging": "🏨 住宿推荐",
+    "itinerary": "📅 分日行程",
+    "budget": "💰 总预算拆解",
+    "booking": "🚨 必做预约 & 证件清单",
+    "pitfalls": "⚠️ 避坑提示",
+    "outbound": "🌍 出境须知",
+    "packing": "🎒 行前物品清单",
+    "knowledge": "🌳 行程知识图谱",
+}
+_TABLE_SCHEMAS = {
+    "transport": (
+        ("方向", r"方向|行程"),
+        ("推荐方式", r"方式|交通|工具"),
+        ("耗时", r"耗时|时长|时间"),
+        ("参考价（人均）", r"参考价|价格|费用|票价"),
+        ("提示", r"提示|建议|备注"),
+    ),
+    "lodging": (
+        ("档位", r"档位|类型|级别"),
+        ("推荐区域/酒店", r"区域|酒店|住宿|推荐"),
+        ("区位优势", r"区位|优势|位置|特色"),
+        ("人均/晚参考价", r"人均|参考价|价格|房价"),
+        ("适合人群", r"适合|人群"),
+    ),
+    "itinerary": (
+        ("时段", r"时段|时间"),
+        ("安排", r"安排|活动|行程|项目"),
+        ("耗时", r"耗时|时长"),
+        ("提示", r"提示|建议|备注|费用"),
+    ),
+    "daily_budget": (
+        ("项目", r"项目|类别"),
+        ("明细", r"明细|说明|计算|内容"),
+        ("费用", r"费用|金额|小计|合计"),
+        ("备注", r"备注|提示"),
+    ),
+    "budget": (
+        ("类别", r"类别|项目|分类"),
+        ("明细", r"明细|说明|计算"),
+        ("人均", r"人均"),
+        ("合计", r"合计|总价|总计"),
+    ),
+    "outbound": (
+        ("项目", r"项目|类别"),
+        ("详情", r"详情|说明|建议"),
+    ),
+    "packing": (
+        ("类别", r"类别|分类"),
+        ("物品（写出具体数量）", r"物品|清单|数量|内容"),
+    ),
+}
+
+
 _MONEY_RANGE_RE = re.compile(
     r"[¥￥]\s*(?P<low>\d[\d,]*(?:\.\d+)?)"
     r"(?:\s*(?:-|–|—|~|至)\s*[¥￥]?\s*(?P<high>\d[\d,]*(?:\.\d+)?))?"
@@ -44,6 +105,259 @@ def correct_daily_budget_totals(markdown_content: str) -> str:
     金额区间。无法可靠识别至少两项明细时保持原文，避免猜测。
     """
     return "\n".join(_correct_daily_budget_line(line) for line in markdown_content.split("\n"))
+
+
+def normalize_report_markdown(markdown_content: str) -> str:
+    """统一模型输出中会影响文档格式的结构，同时保留原始内容。"""
+    markdown_content = correct_daily_budget_totals(markdown_content)
+    markdown_content = _canonicalize_headings(markdown_content)
+    markdown_content = _normalize_and_order_sections(markdown_content)
+    section_re = re.compile(
+        r"(?P<heading>^##[^\n]*行程知识图谱[^\n]*\n)"
+        r"(?P<body>.*?)(?=^##\s|^---\s*$|^>\s|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+
+    def normalize_section(match: re.Match) -> str:
+        heading = match.group("heading")
+        body = match.group("body").strip()
+        fence = re.search(r"```[^\n]*\n?(.*?)```", body, re.DOTALL)
+        if fence:
+            graph = _normalize_knowledge_graph(fence.group(1))
+            body = body[:fence.start()] + f"```\n{graph}\n```" + body[fence.end():]
+        elif re.search(r"\bDay\s*\d+\b", body, re.IGNORECASE):
+            body = f"```\n{_normalize_knowledge_graph(body)}\n```"
+        return heading + body.strip() + "\n\n"
+
+    return section_re.sub(normalize_section, markdown_content)
+
+
+def _canonicalize_headings(markdown_content: str) -> str:
+    lines = []
+    for line in markdown_content.splitlines():
+        heading = re.match(r"^(#{2,4})\s+(.+?)\s*$", line)
+        if heading:
+            level, title = heading.groups()
+            day = re.match(
+                r"^(?:Day\s*|第\s*)(\d+)(?:\s*[天日])?\s*[-—:：·.]?\s*(.*)$",
+                re.sub(r"[*_]+", "", title).strip(),
+                re.IGNORECASE,
+            )
+            if day:
+                theme = day.group(2).strip(" -—:：·.")
+                lines.append(f"### Day {int(day.group(1))}" + (f" · {theme}" if theme else ""))
+                continue
+
+            key = _section_key(title)
+            # H3/H4 中“预约清单”等是合法子标题，只提升明确的顶级板块名。
+            if key and (level == "##" or _is_explicit_top_level_title(title, key)):
+                lines.append("## " + _SECTION_TITLES[key])
+                continue
+        lines.append(line)
+    suffix = "\n" if markdown_content.endswith("\n") else ""
+    return "\n".join(lines) + suffix
+
+
+def _section_key(title: str) -> str | None:
+    compact = re.sub(r"[\s*_#·&🌤️🚄🏨📅💰🚨⚠️🌍🎒🌳]+", "", title)
+    if "知识图谱" in compact:
+        return "knowledge"
+    if "分日行程" in compact or "详细行程" in compact or "每日行程" in compact:
+        return "itinerary"
+    if "总预算" in compact or "预算拆解" in compact or "费用汇总" in compact:
+        return "budget"
+    if "天气" in compact or "穿搭" in compact:
+        return "weather"
+    if "住宿" in compact or "酒店推荐" in compact:
+        return "lodging"
+    if "交通" in compact and "市内" not in compact:
+        return "transport"
+    if "必做预约" in compact or ("预约" in compact and "证件" in compact):
+        return "booking"
+    if "避坑" in compact or "风险提示" in compact:
+        return "pitfalls"
+    if "出境须知" in compact or "出境指南" in compact:
+        return "outbound"
+    if ("物品" in compact or "行李" in compact) and "清单" in compact:
+        return "packing"
+    return None
+
+
+def _is_explicit_top_level_title(title: str, key: str) -> bool:
+    compact = re.sub(r"[\s*_#·&🌤️🚄🏨📅💰🚨⚠️🌍🎒🌳]+", "", title)
+    explicit = {
+        "weather": ("天气与穿搭",),
+        "transport": ("城际交通建议",),
+        "lodging": ("住宿推荐",),
+        "itinerary": ("分日行程", "详细行程", "每日行程"),
+        "budget": ("总预算拆解", "费用汇总"),
+        "booking": ("必做预约证件清单",),
+        "pitfalls": ("避坑提示", "风险提示"),
+        "outbound": ("出境须知", "出境指南"),
+        "packing": ("行前物品清单", "行李清单"),
+        "knowledge": ("行程知识图谱",),
+    }
+    return any(name in compact for name in explicit[key])
+
+
+def _normalize_and_order_sections(markdown_content: str) -> str:
+    section_matches = list(re.finditer(r"^##\s+(.+?)\s*$", markdown_content, re.MULTILINE))
+    if not section_matches:
+        return markdown_content
+
+    preamble = markdown_content[:section_matches[0].start()].rstrip()
+    known: dict[str, list[str]] = {}
+    unknown: list[str] = []
+    recognized_keys = []
+    for index, match in enumerate(section_matches):
+        end = section_matches[index + 1].start() if index + 1 < len(section_matches) else len(markdown_content)
+        title = match.group(1).strip()
+        body = markdown_content[match.end():end].strip()
+        key = _section_key(title)
+        if key:
+            recognized_keys.append(key)
+            body = _normalize_section_tables(body, key)
+            known.setdefault(key, []).append(body)
+        else:
+            unknown.append(f"## {title}\n\n{body}".strip())
+
+    # 小型 Markdown 片段保持原样；完整攻略才启用固定九板块契约。
+    if len(set(recognized_keys)) < 5:
+        return markdown_content
+
+    parts = [preamble] if preamble else []
+    for key in _SECTION_ORDER:
+        bodies = known.get(key, [])
+        if not bodies and key not in _REQUIRED_SECTIONS:
+            continue
+        body = "\n\n".join(part for part in bodies if part).strip()
+        if not body:
+            body = "> 本板块未生成有效内容，请以官方实时信息为准。"
+        parts.append(f"## {_SECTION_TITLES[key]}\n\n{body}")
+        if key == "packing" and unknown:
+            parts.extend(unknown)
+            unknown = []
+    parts.extend(unknown)
+    return "\n\n".join(parts).rstrip() + "\n"
+
+
+def _normalize_section_tables(body: str, section_key: str) -> str:
+    default_schema = _TABLE_SCHEMAS.get(section_key)
+    if not default_schema:
+        return body
+
+    # 只允许水平空白，避免 ``\s*`` 吞掉表格后的空行并制造一行空数据。
+    table_re = re.compile(r"(?:^[ \t]*\|.*\|[ \t]*$\n?)+", re.MULTILINE)
+
+    def normalize_table(match: re.Match) -> str:
+        rows = _parse_table(match.group(0).splitlines())
+        if not rows:
+            return match.group(0)
+        source_headers = [re.sub(r"[*_`]+", "", cell).strip() for cell in rows[0]]
+        schema = default_schema
+        if section_key == "itinerary":
+            header_text = " ".join(source_headers)
+            if not re.search(r"时段|时间", header_text) and re.search(
+                r"项目|类别|费用|金额|明细|合计", header_text
+            ):
+                schema = _TABLE_SCHEMAS["daily_budget"]
+        used: set[int] = set()
+        mapping: list[int | None] = []
+        # 先完成所有语义匹配，再做位置兜底；否则三列表中的“建议”可能被
+        # 前一个缺失的“耗时”抢占，导致内容落到错误列。
+        for _, aliases in schema:
+            source_index = next(
+                (idx for idx, header in enumerate(source_headers) if idx not in used and re.search(aliases, header)),
+                None,
+            )
+            if source_index is not None:
+                used.add(source_index)
+            mapping.append(source_index)
+        for position, source_index in enumerate(mapping):
+            if source_index is not None:
+                continue
+            fallback = position if position < len(source_headers) and position not in used else next(
+                (idx for idx in range(len(source_headers)) if idx not in used), None
+            )
+            if fallback is not None:
+                mapping[position] = fallback
+                used.add(fallback)
+
+        normalized_rows = []
+        for source_row in rows[1:]:
+            row = [source_row[idx] if idx is not None and idx < len(source_row) else "" for idx in mapping]
+            extras = [source_row[idx] for idx in range(len(source_row)) if idx not in used and source_row[idx]]
+            if extras:
+                row[-1] = "；".join(filter(None, [row[-1], *extras]))
+            normalized_rows.append(row)
+
+        headers = [header for header, _ in schema]
+        separator = ["---"] * len(headers)
+        all_rows = [headers, separator, *normalized_rows]
+        return "\n".join("| " + " | ".join(row) + " |" for row in all_rows) + "\n"
+
+    return table_re.sub(normalize_table, body).rstrip()
+
+
+def _normalize_knowledge_graph(content: str) -> str:
+    """将知识图谱稳定为根节点、逐日分支和汇总行组成的等宽文本树。"""
+    text = re.sub(r"[ \t]*\n[ \t]*", " ", content.strip())
+    if not re.search(r"\bDay\s*\d+\b", text, re.IGNORECASE):
+        return content.strip()
+
+    # 兼容模型输出的 ├──、|——、│──，以及完全漏掉树枝符号的 Day N。
+    branch_marker = r"(?:[|│├└]\s*)?[─—-]{2,}"
+    text = re.sub(
+        rf"\s*{branch_marker}\s*(?=Day\s*\d+\b)",
+        "\n@@DAY@@",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"\s*{branch_marker}\s*(?=🏁)", "\n@@FINISH@@", text
+    )
+    text = re.sub(
+        r"(?<!@@DAY@@)(?<!^)[ \t]+(?=Day\s*\d+\s*[·.])",
+        "\n@@DAY@@",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+(?=[💰📏🏔️👥✅])", "\n@@SUMMARY@@", text)
+
+    root_parts: list[str] = []
+    day_parts: list[str] = []
+    finish_parts: list[str] = []
+    summary_parts: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("@@DAY@@"):
+            day_parts.append(line.removeprefix("@@DAY@@").strip())
+        elif line.startswith("@@FINISH@@"):
+            finish_parts.append(line.removeprefix("@@FINISH@@").strip())
+        elif line.startswith("@@SUMMARY@@"):
+            summary_parts.append(line.removeprefix("@@SUMMARY@@").strip())
+        elif re.match(r"Day\s*\d+\b", line, re.IGNORECASE):
+            day_parts.append(line)
+        elif line[0] in "💰📏🏔️👥✅":
+            summary_parts.append(line)
+        else:
+            root_parts.append(line)
+
+    if not day_parts:
+        return content.strip()
+
+    result = [" ".join(root_parts).strip()] if root_parts else []
+    has_finish = bool(finish_parts)
+    for index, day in enumerate(day_parts):
+        is_last_without_finish = index == len(day_parts) - 1 and not has_finish
+        result.append(("└── " if is_last_without_finish else "├── ") + day)
+    result.extend("└── " + finish for finish in finish_parts)
+    if summary_parts:
+        result.append("")
+        result.extend(summary_parts)
+    return "\n".join(result)
 
 
 def _correct_daily_budget_line(line: str) -> str:
@@ -284,6 +598,12 @@ def _parse_table(lines: list[str]) -> list[list[str]]:
             continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
         rows.append(cells)
+    if rows:
+        width = max(len(row) for row in rows)
+        while len(rows[0]) < width:
+            rows[0].append(f"详情{len(rows[0]) + 1}")
+        for row in rows:
+            row.extend([""] * (width - len(row)))
     return rows
 
 
@@ -374,7 +694,7 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
 
         # 代码块（通常是知识图谱树）
         elif t == "code":
-            html += f'<div class="tree">{_escape_html(content)}</div>\n'
+            html += f'<div class="tree">{_escape_html(_normalize_knowledge_graph(content))}</div>\n'
 
         # 引用块
         elif t == "blockquote":
@@ -654,7 +974,7 @@ class TravelGuideGenerator:
 
     def to_html(self, markdown_content: str, guide_id: str) -> str:
         """Markdown → 完整 HTML 页面"""
-        markdown_content = correct_daily_budget_totals(markdown_content)
+        markdown_content = normalize_report_markdown(markdown_content)
         blocks = _parse_markdown_to_blocks(markdown_content)
         body_html = _blocks_to_html_fragment(blocks)
 
@@ -692,7 +1012,7 @@ class TravelGuideGenerator:
 
     def to_docx(self, markdown_content: str, guide_id: str) -> bytes:
         """Markdown → DOCX"""
-        markdown_content = correct_daily_budget_totals(markdown_content)
+        markdown_content = normalize_report_markdown(markdown_content)
         blocks = _parse_markdown_to_blocks(markdown_content)
         doc = Document()
 

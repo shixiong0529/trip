@@ -92,6 +92,22 @@ def test_download_html_recalculates_cached_daily_budget(isolated_db):
     assert "旧合计¥2,458" not in response.text
 
 
+def test_download_html_normalizes_cached_one_line_knowledge_graph(isolated_db):
+    markdown = (
+        "# 测试\n\n## 🌳 行程知识图谱\n```\n"
+        "[北京] ├── Day 1 · 抵达 → 故宫 → ¥100/人 "
+        "└── Day 2 · 返程 → 北京站 → ¥80/人\n```\n"
+    )
+    isolated_db.save_guide("graph-fix", "<html>旧单行图谱</html>", markdown)
+
+    response = client.get("/api/download/graph-fix?format=html")
+
+    assert response.status_code == 200
+    assert "[北京]\n├── Day 1" in response.text
+    assert "\n└── Day 2" in response.text
+    assert "旧单行图谱" not in response.text
+
+
 # ---------- 行程管理 ----------
 
 def test_save_trip_auto_parses_fields():

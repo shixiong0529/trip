@@ -13,6 +13,7 @@ from generator import (
     _blocks_to_html_fragment,
     _extract_stats,
     correct_daily_budget_totals,
+    normalize_report_markdown,
     TravelGuideGenerator,
 )
 
@@ -98,6 +99,20 @@ def test_daily_budget_total_is_recalculated_from_itemized_costs():
     assert corrected.count("**") == markdown.count("**")
 
 
+def test_single_traveler_daily_budget_matches_all_itemized_costs():
+    markdown = (
+        "**本日预算：** **1人合计 ¥630"
+        "（住宿¥300+餐饮¥100+门票¥0+租车分摊¥80+航班¥380）**"
+    )
+
+    corrected = correct_daily_budget_totals(markdown)
+
+    assert corrected == (
+        "**本日预算：** **1人合计 ¥860"
+        "（住宿¥300+餐饮¥100+门票¥0+租车分摊¥80+航班¥380）**"
+    )
+
+
 def test_daily_budget_supports_equations_multiplication_and_ranges():
     markdown = (
         "💰 **本日预算：** 3人合计约¥999"
@@ -131,6 +146,129 @@ def test_budget_correction_keeps_html_structure_and_styles(gen):
     assert 'class="badge badge-orange"' in html
     assert "3人合计约¥2,838" in html
     assert "<style>" in html
+
+
+def test_one_line_knowledge_graph_is_normalized_to_one_day_per_line():
+    markdown = (
+        "# 云南8日游\n\n## 🌳 行程知识图谱\n```\n"
+        "[武汉] ├── Day 1 · 高铁启程 → 昆明 / 1150km → ¥1068/人 "
+        "|—— Day 2 · 石林奇观 → 昆明 / 90km → ¥241/人 "
+        "├── Day 3 · 奔赴大理 → 大理 / 320km → ¥665/人 "
+        "└── 🏁 武汉 💰 人均总预算：¥5,000 📏 总里程：1,560km\n"
+        "```\n\n> **免责声明**：测试\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert "[武汉]\n├── Day 1" in normalized
+    assert "\n├── Day 2" in normalized
+    assert "\n├── Day 3" in normalized
+    assert "\n└── 🏁 武汉" in normalized
+    assert "\n\n💰 人均总预算" in normalized
+    assert "\n📏 总里程" in normalized
+    assert "|——" not in normalized
+
+
+def test_knowledge_graph_without_code_fence_gets_canonical_fence():
+    markdown = (
+        "# 测试\n\n## 🌳 行程知识图谱\n"
+        "[北京] Day 1 · 抵达 → 故宫 → ¥100/人 "
+        "Day 2 · 返程 → 北京站 → ¥80/人\n\n---\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert "## 🌳 行程知识图谱\n```\n[北京]" in normalized
+    assert "├── Day 1" in normalized
+    assert "└── Day 2" in normalized
+    assert "\n```\n\n---" in normalized
+
+
+def test_knowledge_graph_html_keeps_existing_report_styles(gen):
+    markdown = (
+        "# 测试\n\n## 🌳 行程知识图谱\n```\n"
+        "[北京] ├── Day 1 · 抵达 → 故宫 → ¥100/人 "
+        "└── Day 2 · 返程 → 北京站 → ¥80/人\n```\n"
+    )
+
+    html = gen.to_html(markdown, "stable-graph")
+
+    assert html.count('class="tree"') == 1
+    assert "[北京]\n├── Day 1" in html
+    assert "\n└── Day 2" in html
+    assert "white-space: pre-wrap" in html
+
+
+def test_report_normalization_is_idempotent():
+    markdown = (
+        "# 测试\n\n## 🌳 行程知识图谱\n```\n"
+        "[北京] |—— Day 1 · 抵达 → 故宫 → ¥100/人 "
+        "|—— Day 2 · 返程 → 北京站 → ¥80/人\n```\n"
+    )
+
+    once = normalize_report_markdown(markdown)
+
+    assert normalize_report_markdown(once) == once
+
+
+def test_full_report_sections_are_canonical_and_ordered():
+    markdown = (
+        "# 测试行程\n\n"
+        "**路线总览：** 北京 → 上海\n\n**重要提示：** 测试。\n\n"
+        "## 行前物品清单\n| 分类 | 清单 | 备注 |\n|---|---|---|\n| 证件 | 身份证×2 | 随身 |\n\n"
+        "## 每日行程\n### 第1天：抵达\n| 时间 | 活动 | 建议 |\n|---|---|---|\n| 09:00 | 抵达 | 提前出发 |\n\n"
+        "💰 **本日预算**\n| 类别 | 内容 | 金额 |\n|---|---|---|\n| 交通 | 高铁 | ¥200 |\n\n"
+        "## 酒店推荐\n| 类型 | 酒店 | 位置 | 房价 | 人群 |\n|---|---|---|---|---|\n| 舒适 | 测试酒店 | 市中心 | ¥300 | 家庭 |\n\n"
+        "## 风险提示\n- 注意安全\n\n"
+        "## 费用汇总\n| 项目 | 计算 | 人均 | 总计 |\n|---|---|---|---|\n| 交通 | 高铁 | ¥100 | ¥200 |\n\n"
+        "## 天气攻略\n- 晴天\n\n"
+        "## 交通攻略\n| 行程 | 工具 | 时间 | 票价 | 备注 |\n|---|---|---|---|---|\n| 去程 | 高铁 | 2h | ¥100 | 提前购票 |\n\n"
+        "## 预约与证件\n### 预约清单\n- [ ] 景点\n\n"
+        "## 行程知识图谱\n```\n[北京] Day 1 · 抵达 → 上海 → ¥100/人\n```\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    expected_titles = [
+        "## 🌤️ 天气与穿搭",
+        "## 🚄 城际交通建议",
+        "## 🏨 住宿推荐",
+        "## 📅 分日行程",
+        "## 💰 总预算拆解",
+        "## 🚨 必做预约 & 证件清单",
+        "## ⚠️ 避坑提示",
+        "## 🎒 行前物品清单",
+        "## 🌳 行程知识图谱",
+    ]
+    positions = [normalized.index(title) for title in expected_titles]
+    assert positions == sorted(positions)
+    assert "### Day 1 · 抵达" in normalized
+    assert "| 时段 | 安排 | 耗时 | 提示 |" in normalized
+    assert "| 09:00 | 抵达 |  | 提前出发 |" in normalized
+    assert "| 项目 | 明细 | 费用 | 备注 |" in normalized
+    assert "| 交通 | 高铁 | ¥200 |  |" in normalized
+    assert "| 方向 | 推荐方式 | 耗时 | 参考价（人均） | 提示 |" in normalized
+    assert "| 类别 | 物品（写出具体数量） |" in normalized
+    assert "身份证×2；随身" in normalized
+
+
+def test_full_report_missing_sections_receive_stable_fallbacks():
+    markdown = (
+        "# 测试\n\n"
+        "## 天气与穿搭\n天气\n\n"
+        "## 城际交通建议\n交通\n\n"
+        "## 住宿推荐\n住宿\n\n"
+        "## 分日行程\n### Day 1 · 测试\n安排\n\n"
+        "## 总预算拆解\n预算\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert normalized.count("本板块未生成有效内容") == 4
+    assert "## 🚨 必做预约 & 证件清单" in normalized
+    assert "## ⚠️ 避坑提示" in normalized
+    assert "## 🎒 行前物品清单" in normalized
+    assert "## 🌳 行程知识图谱" in normalized
 
 
 def test_heading_with_own_emoji_does_not_get_extra_icon():

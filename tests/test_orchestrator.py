@@ -26,3 +26,10 @@ def test_orchestrator_wires_config_max_tokens(monkeypatch):
 def test_orchestrator_rejects_empty_key():
     with pytest.raises(LLMClientError):
         TravelGuideOrchestrator("https://api.example.com/v1", "", "m")
+
+
+def test_default_temperature_prioritizes_structured_report_stability(monkeypatch):
+    import config
+    monkeypatch.delenv("LLM_TEMPERATURE", raising=False)
+
+    assert config.LLMConfig().temperature == 0.2
