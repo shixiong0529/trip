@@ -113,3 +113,14 @@ def test_guide_template_has_no_hero_tag_styles():
     assert ".hero .tag" not in guide
     assert ".stats-grid" not in guide
     assert ".stat-card" not in guide
+
+
+def test_mobile_result_title_and_guide_id_use_separate_rows():
+    index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    mobile = css.split("@media (max-width: 640px)", 1)[1]
+
+    assert "flex-direction: column" in mobile
+    assert ".result-badge { white-space: nowrap; }" in mobile
+    assert "overflow-wrap: anywhere" in mobile
+    assert "mobile-result-header" in index
