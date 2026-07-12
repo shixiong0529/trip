@@ -117,7 +117,7 @@ def test_h1_followed_by_plain_paragraph_is_preserved():
     assert "这是一段没有统计数字的普通说明文字" in html
 
 
-def test_intro_stats_are_not_rendered_as_report_cards(gen):
+def test_intro_stats_render_as_report_cards(gen):
     md = (
         "# 🗺️ 北京4日游\n\n"
         "4天1人，人均预算 ¥2,550，核心景点 8 个\n\n"
@@ -127,11 +127,12 @@ def test_intro_stats_are_not_rendered_as_report_cards(gen):
         "| 去程 | 高铁 |\n"
     )
     html = gen.to_html(md, "no-stats")
-    assert 'class="stats-grid"' not in html
-    assert 'class="stat-card"' not in html
-    assert "旅行天数" not in html
-    assert "出行人数" not in html
-    assert "人均预算" not in html
+    assert 'class="stats-grid"' in html
+    assert html.count('class="stat-card"') == 4
+    assert "旅行天数" in html
+    assert "出行人数" in html
+    assert "人均预算" in html
+    assert "4天1人，人均预算" not in html
 
 
 def test_report_table_labels_do_not_break_across_lines(gen):
@@ -219,6 +220,15 @@ def test_to_html_has_hero_and_balanced_divs(gen):
     assert '<div class="hero">' in html
     assert '<div class="container">' in html
     assert html.count("<div") == html.count("</div")
+
+
+def test_hero_has_no_opening_tags(gen):
+    html = gen.to_html("# 🗺️ 成都3日游\n", "no-hero-tags")
+
+    assert '<div class="tags">' not in html
+    assert '<span class="tag">' not in html
+    assert "多源数据" not in html
+    assert "可执行行程" not in html
 
 
 def test_to_html_does_not_insert_route_map(gen):

@@ -282,10 +282,6 @@ def _render_hero(title: str) -> str:
 <div class="hero">
   <h1>{_inline_md(title)}</h1>
   <p class="meta">AI 旅行管家 · 路小仙（Leo）定制</p>
-  <div class="tags">
-    <span class="tag">多源数据</span>
-    <span class="tag">可执行行程</span>
-  </div>
 </div>
 '''
 
@@ -316,14 +312,27 @@ def _render_overview(paras: list[str]) -> str:
             if part.strip()
         )
 
-    # "4天1人，人均预算..."只用于报告元数据，不重复渲染成普通卡片。
+    # 将模型开头的统计句转成易扫读的统计卡片，不显示原始长句。
     if segments and len(_extract_stats(segments[0])) >= 2:
+        html += _render_stats_grid(_extract_stats(segments[0]))
         segments = segments[1:]
 
     for p in segments:
         html += _render_paragraph_card(p)
 
     return html
+
+
+def _render_stats_grid(stats: list[tuple[str, str]]) -> str:
+    """将关键统计渲染为参考报告风格的紧凑卡片。"""
+    cards = "".join(
+        '<div class="stat-card">'
+        f'<div class="stat-value">{_inline_md(value)}</div>'
+        f'<div class="stat-label">{_inline_md(label)}</div>'
+        '</div>'
+        for label, value in stats
+    )
+    return f'<div class="stats-grid">{cards}</div>\n'
 
 
 def _render_paragraph_card(content: str) -> str:
