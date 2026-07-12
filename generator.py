@@ -718,9 +718,13 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
 
 def _render_hero(title: str) -> str:
     """渲染 Hero 区"""
+    clean_title = re.sub(
+        r"^(?:🗺️?|🚗|🚙|✈️?|🚄|🚆|🌍|📍)\s*", "", title.strip()
+    )
+    display_title = f"🚗 {clean_title or title.strip()}"
     return f'''<div class="container">
 <div class="hero">
-  <h1>{_inline_md(title)}</h1>
+  <h1>{_inline_md(display_title)}</h1>
   <p class="meta">AI 旅行管家 · 路小仙（Leo）定制</p>
 </div>
 '''
