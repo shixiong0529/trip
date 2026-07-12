@@ -170,7 +170,8 @@ async def generate_guide(request: Request):
 
                 # 使用完整 UUID，避免高并发下 8 位短 ID 碰撞后覆盖其他人的报告。
                 guid = uuid.uuid4().hex
-                from generator import TravelGuideGenerator
+                from generator import TravelGuideGenerator, correct_daily_budget_totals
+                full_markdown = correct_daily_budget_totals(full_markdown)
                 gen = TravelGuideGenerator(app_config.templates_dir)
                 html_content = await asyncio.to_thread(gen.to_html, full_markdown, guid)
 
@@ -216,7 +217,10 @@ async def download_guide(guide_id: str, format: str = Query("html")):
         try:
             # WeasyPrint 渲染是重 CPU 同步操作，放线程池避免阻塞事件循环
             async with _export_gate.slot():
-                pdf_bytes = await asyncio.to_thread(gen.to_pdf, guide["html"], guide_id)
+                html_content = await asyncio.to_thread(
+                    gen.to_html, guide.get("markdown") or "", guide_id
+                )
+                pdf_bytes = await asyncio.to_thread(gen.to_pdf, html_content, guide_id)
             return Response(
                 content=pdf_bytes,
                 media_type="application/pdf",
@@ -235,7 +239,11 @@ async def download_guide(guide_id: str, format: str = Query("html")):
         )
 
     elif format == "html":
-        return HTMLResponse(content=guide["html"])
+        # 依据 Markdown 实时渲染，使历史缓存也能应用内容校验修复；模板不变。
+        html_content = await asyncio.to_thread(
+            gen.to_html, guide.get("markdown") or "", guide_id
+        )
+        return HTMLResponse(content=html_content)
 
     raise HTTPException(status_code=400, detail="format 仅支持 html、pdf 或 docx")
 
@@ -251,6 +259,8 @@ async def save_trip(request: Request):
     from services import trip_store
     body = await request.json()
     markdown = body.get("markdown", "")
+    from generator import correct_daily_budget_totals
+    markdown = correct_daily_budget_totals(markdown)
     raw_destination = body.get("destination", "")
 
     destination = raw_destination

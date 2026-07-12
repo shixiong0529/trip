@@ -77,6 +77,21 @@ def test_download_rejects_unknown_format(isolated_db):
     assert resp.status_code == 400
 
 
+def test_download_html_recalculates_cached_daily_budget(isolated_db):
+    markdown = (
+        "# 测试\n\n### Day 1 · 抵达\n"
+        "💰 **本日预算：** 3人合计约¥2,458"
+        "（高铁¥2,208 + 打车¥80 + 晚餐¥300 + 酒店¥250）\n"
+    )
+    isolated_db.save_guide("budget-fix", "<html>旧合计¥2,458</html>", markdown)
+
+    response = client.get("/api/download/budget-fix?format=html")
+
+    assert response.status_code == 200
+    assert "3人合计约¥2,838" in response.text
+    assert "旧合计¥2,458" not in response.text
+
+
 # ---------- 行程管理 ----------
 
 def test_save_trip_auto_parses_fields():
@@ -96,6 +111,21 @@ def test_save_trip_auto_parses_fields():
     assert trip["days"] == 3
     assert trip["travelers"] == 2
     assert trip["budget"] == 4000
+
+
+def test_save_trip_persists_corrected_daily_budget():
+    markdown = (
+        "# 成都3日游\n\n"
+        "💰 **本日预算：** 3人合计约¥2,458"
+        "（高铁¥2,208 + 打车¥80 + 晚餐¥300 + 酒店¥250）"
+    )
+    response = client.post(
+        "/api/trips", json={"destination": "成都", "markdown": markdown}
+    )
+
+    saved = client.get(f"/api/trips/{response.json()['trip_id']}").json()
+
+    assert "3人合计约¥2,838" in saved["markdown"]
 
 
 def test_view_trip_200_and_404():

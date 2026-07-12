@@ -10,6 +10,7 @@ macOS 上可通过 `brew install pango cairo glib` 安装。
 import re
 import io
 import logging
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader
@@ -22,6 +23,124 @@ from docx.oxml.ns import qn
 from services.route_map import normalize_route_overview
 
 logger = logging.getLogger(__name__)
+
+
+_MONEY_RANGE_RE = re.compile(
+    r"[¥￥]\s*(?P<low>\d[\d,]*(?:\.\d+)?)"
+    r"(?:\s*(?:-|–|—|~|至)\s*[¥￥]?\s*(?P<high>\d[\d,]*(?:\.\d+)?))?"
+)
+_DAILY_BUDGET_TOTAL_RE = re.compile(
+    r"(?P<prefix>本日预算.{0,80}?[¥￥]\s*)"
+    r"(?P<amount>\d[\d,]*(?:\.\d+)?"
+    r"(?:\s*(?:-|–|—|~|至)\s*[¥￥]?\s*\d[\d,]*(?:\.\d+)?)?)"
+)
+
+
+def correct_daily_budget_totals(markdown_content: str) -> str:
+    """用明细复算每个“本日预算”的合计，仅替换错误的金额文本。
+
+    模型擅长生成行程，但并不可靠地执行算术。这里把括号内以 ``+``、
+    ``、`` 或分号分隔的费用视为权威明细，支持单价乘人数、显式等式和
+    金额区间。无法可靠识别至少两项明细时保持原文，避免猜测。
+    """
+    return "\n".join(_correct_daily_budget_line(line) for line in markdown_content.split("\n"))
+
+
+def _correct_daily_budget_line(line: str) -> str:
+    if "本日预算" not in line:
+        return line
+
+    declared = _DAILY_BUDGET_TOTAL_RE.search(line)
+    if not declared:
+        return line
+
+    tail = line[declared.end():]
+    open_positions = [pos for pos in (tail.find("（"), tail.find("(")) if pos >= 0]
+    if not open_positions:
+        return line
+    open_pos = min(open_positions)
+    opener = tail[open_pos]
+    closer = "）" if opener == "（" else ")"
+    close_pos = tail.find(closer, open_pos + 1)
+    if close_pos < 0:
+        return line
+
+    detail = tail[open_pos + 1:close_pos]
+    components = re.split(r"\s*(?:\+|＋|；|;|、|，|\s和\s)\s*", detail)
+    costs = [cost for part in components if (cost := _component_cost(part)) is not None]
+    if len(costs) < 2:
+        return line
+
+    low_total = sum((cost[0] for cost in costs), Decimal("0"))
+    high_total = sum((cost[1] for cost in costs), Decimal("0"))
+    corrected = _format_money(low_total)
+    if high_total != low_total:
+        corrected += "-¥" + _format_money(high_total)
+
+    start, end = declared.span("amount")
+    return line[:start] + corrected + line[end:]
+
+
+def _component_cost(component: str) -> tuple[Decimal, Decimal] | None:
+    component = component.strip()
+    if not component or re.search(r"人均|合计|总计", component):
+        return None
+
+    # “单价×人数=合计”以等号右侧结果为准，避免单价与结果重复计入。
+    equation_parts = re.split(r"[=＝]", component)
+    if len(equation_parts) > 1:
+        return _first_money_range(equation_parts[-1])
+
+    money_match = _MONEY_RANGE_RE.search(component)
+    if not money_match:
+        return None
+    money = _money_match_to_range(money_match)
+    if money is None:
+        return None
+
+    before = component[:money_match.start()]
+    after = component[money_match.end():]
+    quantity_before = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:人|晚|天|张|间|辆|次|份|套|位)?\s*[×xX*]\s*$",
+        before,
+    )
+    quantity_after = re.match(
+        r"\s*(?:/\s*(?:人|晚|天|张|间|辆|次|份|套|位))?"
+        r"\s*[×xX*]\s*(\d+(?:\.\d+)?)",
+        after,
+    )
+    quantity_text = (
+        quantity_before.group(1) if quantity_before else
+        quantity_after.group(1) if quantity_after else None
+    )
+    if quantity_text:
+        try:
+            quantity = Decimal(quantity_text)
+            return money[0] * quantity, money[1] * quantity
+        except InvalidOperation:
+            return None
+    return money
+
+
+def _first_money_range(text: str) -> tuple[Decimal, Decimal] | None:
+    match = _MONEY_RANGE_RE.search(text)
+    return _money_match_to_range(match) if match else None
+
+
+def _money_match_to_range(match: re.Match) -> tuple[Decimal, Decimal] | None:
+    try:
+        low = Decimal(match.group("low").replace(",", ""))
+        high_text = match.group("high")
+        high = Decimal(high_text.replace(",", "")) if high_text else low
+        return low, high
+    except (InvalidOperation, AttributeError):
+        return None
+
+
+def _format_money(value: Decimal) -> str:
+    if value == value.to_integral_value():
+        return f"{int(value):,}"
+    return f"{value:,.2f}".rstrip("0").rstrip(".")
 
 # WeasyPrint 延迟导入，环境不支持时优雅降级
 _weasyprint_available = False
@@ -535,6 +654,7 @@ class TravelGuideGenerator:
 
     def to_html(self, markdown_content: str, guide_id: str) -> str:
         """Markdown → 完整 HTML 页面"""
+        markdown_content = correct_daily_budget_totals(markdown_content)
         blocks = _parse_markdown_to_blocks(markdown_content)
         body_html = _blocks_to_html_fragment(blocks)
 
@@ -572,6 +692,7 @@ class TravelGuideGenerator:
 
     def to_docx(self, markdown_content: str, guide_id: str) -> bytes:
         """Markdown → DOCX"""
+        markdown_content = correct_daily_budget_totals(markdown_content)
         blocks = _parse_markdown_to_blocks(markdown_content)
         doc = Document()
 

@@ -12,6 +12,7 @@ from generator import (
     _parse_markdown_to_blocks,
     _blocks_to_html_fragment,
     _extract_stats,
+    correct_daily_budget_totals,
     TravelGuideGenerator,
 )
 
@@ -82,6 +83,54 @@ def test_adjacent_highlight_budget_lines_become_two_badges():
     assert html.count('class="badge badge-orange"') == 1
     assert "参观博物馆" in html
     assert "本日预算" in html
+
+
+def test_daily_budget_total_is_recalculated_from_itemized_costs():
+    markdown = (
+        "💰 **本日预算：** **3人合计约¥2,458"
+        "（高铁¥2,208 + 打车¥80 + 晚餐¥300 + 酒店¥250）**"
+    )
+
+    corrected = correct_daily_budget_totals(markdown)
+
+    assert "3人合计约¥2,838" in corrected
+    assert "高铁¥2,208 + 打车¥80 + 晚餐¥300 + 酒店¥250" in corrected
+    assert corrected.count("**") == markdown.count("**")
+
+
+def test_daily_budget_supports_equations_multiplication_and_ranges():
+    markdown = (
+        "💰 **本日预算：** 3人合计约¥999"
+        "（高铁¥736×3人=¥2,208 + 门票3人×¥120 + "
+        "午餐¥80/人×3人 + 酒店¥450-¥600）"
+    )
+
+    corrected = correct_daily_budget_totals(markdown)
+
+    assert "3人合计约¥3,258-¥3,408" in corrected
+
+
+def test_daily_budget_without_reliable_details_is_unchanged():
+    markdown = "💰 **本日预算：** 3人合计约¥2,458（费用以现场为准）"
+
+    assert correct_daily_budget_totals(markdown) == markdown
+
+
+def test_budget_correction_keeps_html_structure_and_styles(gen):
+    markdown = (
+        "# 测试\n\n### Day 1 · 抵达\n"
+        "| 时段 | 安排 |\n|---|---|\n| 18:00 | 入住 |\n\n"
+        "🎯 **本日亮点：** 抵达\n"
+        "💰 **本日预算：** 3人合计约¥2,458"
+        "（高铁¥2,208 + 打车¥80 + 晚餐¥300 + 酒店¥250）\n"
+    )
+
+    html = gen.to_html(markdown, "budget-style")
+
+    assert 'class="day-card"' in html
+    assert 'class="badge badge-orange"' in html
+    assert "3人合计约¥2,838" in html
+    assert "<style>" in html
 
 
 def test_heading_with_own_emoji_does_not_get_extra_icon():
