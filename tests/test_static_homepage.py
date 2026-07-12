@@ -95,13 +95,15 @@ def test_guide_template_allows_cjk_wrap_in_tables():
     assert "overflow-wrap: break-word" in guide
 
 
-def test_guide_template_turns_mobile_tables_into_labeled_cards():
+def test_guide_template_keeps_pc_table_structure_on_mobile():
     guide = (ROOT / "templates" / "guide.html").read_text(encoding="utf-8")
 
-    assert ".table-wrapper tbody tr" in guide
-    assert ".table-wrapper tbody td::before" in guide
-    assert "content: attr(data-label)" in guide
-    assert "grid-template-columns: minmax(76px, 28%) minmax(0, 1fr)" in guide
+    mobile = guide.split("@media (max-width: 640px)", 1)[1]
+    assert "-webkit-overflow-scrolling: touch" in mobile
+    assert ".table-wrapper table { min-width: 620px; font-size: .78rem; }" in mobile
+    assert ".kv-table-wrapper table { min-width: 0; }" in mobile
+    assert ".table-wrapper tbody { display: block" not in mobile
+    assert "content: attr(data-label)" not in mobile
 
 
 def test_guide_template_has_no_hero_tag_styles():
