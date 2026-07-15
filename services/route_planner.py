@@ -52,6 +52,38 @@ async def _amap_paced(call):
 # 穷举排序的途经点数上限（8! = 40320，毫秒级；再多切换启发式）
 _BRUTE_FORCE_LIMIT = 8
 
+# 超过其一即视为"长途驾驶段"（仍在 800km/10h 安全上限内），
+# 攻略中给出中途过夜拆分建议
+_LONG_LEG_KM = 500
+_LONG_LEG_HOURS = 6
+
+# 高德 POI 名称里的状态标注，如「坐龙峡风景区(暂停开放)」
+_POI_STATUS_RE = re.compile(r"[（(]([^（）()]*(?:暂停|关闭|停业|歇业|闭园|维护|装修)[^（）()]*)[)）]")
+
+
+def _detect_poi_alerts(stop_names: list[str], poi_names: list[str]) -> list[dict[str, str]]:
+    alerts = []
+    for stop, poi in zip(stop_names, poi_names):
+        m = _POI_STATUS_RE.search(poi or "")
+        if m:
+            alerts.append({"stop": stop, "status": m.group(1).strip()})
+    return alerts
+
+
+async def _regeo_city(
+    client: httpx.AsyncClient, key: str, loc: tuple[float, float]
+) -> Optional[str]:
+    """坐标逆地理编码到「市+区县」，失败返回 None。"""
+    data = await _amap_paced(lambda: _request(client, key, "/geocode/regeo", {
+        "location": f"{loc[0]:.6f},{loc[1]:.6f}",
+    }))
+    comp = ((data or {}).get("regeocode") or {}).get("addressComponent") or {}
+    city = comp.get("city")
+    if not isinstance(city, str) or not city:
+        city = comp.get("province") if isinstance(comp.get("province"), str) else ""
+    district = comp.get("district") if isinstance(comp.get("district"), str) else ""
+    return (city + district) or None
+
 _EXTRACT_SYSTEM = (
     "你是旅行路线信息抽取器，只输出一个 JSON 对象，"
     "禁止输出任何其他文字、解释或代码块标记。"
@@ -63,7 +95,7 @@ _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出
 - stops 是需要前往游玩的具体景点/目的地列表（不含出发地），每项写成「县市名+景点名」（如 "龙山县八面山"、"古丈县坐龙峡"），便于精确定位到景点本身而不是县城
 - 只有相距很近（同一景区、<20km）的景点才合并为一项；同县但相距较远的景点必须各自单独列出
 - 用户明确指定了游览顺序时 user_fixed_order 为 true，stops 按用户顺序排列
-- 行程最终不回出发地时 round_trip 为 false
+- round_trip 默认为 true（自驾默认回出发地取/还车）；只有用户明确表示单程、异地还车、或以其他城市为终点时才为 false
 - 提取不到出发地时 origin 为 null
 
 旅行需求：{query}"""
@@ -111,21 +143,26 @@ async def _plan(query: str, llm) -> Optional[dict]:
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         names = [origin] + stops
-        coords = await _geocode_all(client, key, names)
-        if coords[0] is None:
+        located = await _geocode_all(client, key, names)
+        if located[0] is None:
             # 出发地都定位不到，骨架无从谈起
             return None
 
-        located_names, located_coords, failed = [], [], []
-        for name, coord in zip(names, coords):
-            if coord:
+        located_names, located_coords, poi_names, failed = [], [], [], []
+        for name, item in zip(names, located):
+            if item:
                 located_names.append(name)
-                located_coords.append(coord)
+                located_coords.append(item["coord"])
+                poi_names.append(item.get("poi_name") or "")
             else:
                 failed.append(name)
         # 除出发地外至少要有 2 个可定位途经点才有排序价值
         if len(located_coords) < 3:
             return None
+
+        # 高德 POI 名里的状态标注（如「坐龙峡风景区(暂停开放)」）提出来，
+        # 让攻略主动提醒核实，而不是当它不存在
+        alerts = _detect_poi_alerts(located_names[1:], poi_names[1:])
 
         # 用真实驾车距离矩阵排序：山区路网与直线距离差异很大，直线最短
         # 环线常常不是驾车最短环线（会把顺路点排成折返）。矩阵拿不到时
@@ -150,12 +187,21 @@ async def _plan(query: str, llm) -> Optional[dict]:
             for a, b in zip(seq, seq[1:])
         ]
 
+        # 长途驾驶段（在安全上限内但很累）标注中途落脚点：
+        # 取该段直线中点逆地理编码到城市，供攻略给出"拆一晚"建议
+        for leg, (a, b) in zip(legs, zip(seq, seq[1:])):
+            if leg["km"] > _LONG_LEG_KM or (leg["hours"] or 0) > _LONG_LEG_HOURS:
+                ca, cb = located_coords[a], located_coords[b]
+                mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
+                leg["split_hint"] = await _regeo_city(client, key, mid)
+
     return {
         "seq_names": seq_names,
         "legs": legs,
         "failed": failed,
+        "alerts": alerts,
         "round_trip": round_trip,
-        "markdown": _format_skeleton(seq_names, legs, failed, user_fixed_order),
+        "markdown": _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts),
     }
 
 
@@ -189,13 +235,16 @@ def _parse_location(location: str) -> Optional[tuple[float, float]]:
 
 async def _geocode_all(
     client: httpx.AsyncClient, key: str, names: list[str], poi_from_index: int = 1
-) -> list[Optional[tuple[float, float]]]:
-    """逐个定位。景点（index >= poi_from_index）优先走 POI 搜索——地理编码
-    只认行政地址，"古丈县坐龙峡"会落到古丈县城坐标；而坐龙峡实际在县境
-    最北端、紧贴去龙山的高速走廊，用县城坐标排序会把顺路点排成折返。
-    出发地是城市名，直接地理编码更稳。两种方式互为回退。"""
+) -> list[Optional[dict[str, Any]]]:
+    """逐个定位，返回 {"coord": (lng,lat), "poi_name": str|None} 或 None。
 
-    async def poi_search(name: str) -> Optional[tuple[float, float]]:
+    景点（index >= poi_from_index）优先走 POI 搜索——地理编码只认行政地址，
+    "古丈县坐龙峡"会落到古丈县城坐标；而坐龙峡实际在县境最北端、紧贴去
+    龙山的高速走廊，用县城坐标排序会把顺路点排成折返。出发地是城市名，
+    直接地理编码更稳。两种方式互为回退。poi_name 保留高德官方名称，
+    其中可能带「(暂停开放)」等状态标注，供上层提取提醒。"""
+
+    async def poi_search(name: str) -> Optional[dict[str, Any]]:
         data = await _amap_paced(lambda: _request(client, key, "/place/text", {
             "keywords": name,
             "offset": 1,
@@ -203,14 +252,17 @@ async def _geocode_all(
         }))
         pois = (data or {}).get("pois") or []
         if pois:
-            return _parse_location(pois[0].get("location") or "")
+            coord = _parse_location(pois[0].get("location") or "")
+            if coord:
+                return {"coord": coord, "poi_name": pois[0].get("name") or None}
         return None
 
-    async def geocode(name: str) -> Optional[tuple[float, float]]:
+    async def geocode(name: str) -> Optional[dict[str, Any]]:
         geo = await _amap_paced(lambda: _geocode(client, key, name))
-        return _parse_location((geo or {}).get("location") or "")
+        coord = _parse_location((geo or {}).get("location") or "")
+        return {"coord": coord, "poi_name": None} if coord else None
 
-    async def one(i: int, name: str) -> Optional[tuple[float, float]]:
+    async def one(i: int, name: str) -> Optional[dict[str, Any]]:
         primary, fallback = (poi_search, geocode) if i >= poi_from_index else (geocode, poi_search)
         return await primary(name) or await fallback(name)
 
@@ -330,6 +382,7 @@ def _format_skeleton(
     legs: list[dict[str, Any]],
     failed: list[str],
     user_fixed_order: bool,
+    alerts: Optional[list[dict[str, str]]] = None,
 ) -> str:
     source = "用户指定顺序" if user_fixed_order else "按高德实测距离计算的最短环线"
     lines = [f"### 路线骨架（{source}，顺序禁止更改）", ""]
@@ -348,6 +401,17 @@ def _format_skeleton(
     if failed:
         lines.append(
             f"（以下途经点未能定位、不在上表中，请按地理位置就近插入相邻段：{'、'.join(failed)}）"
+        )
+    for leg in legs:
+        if leg.get("split_hint"):
+            lines.append(
+                f"⚠️ {leg['from']} → {leg['to']} 为长途驾驶段（约 {leg['km']:.0f}km），"
+                f"攻略须建议可在 {leg['split_hint']} 一带中途过夜拆分"
+            )
+    for alert in alerts or []:
+        lines.append(
+            f"⚠️ 高德当前标注「{alert['stop']}」状态为「{alert['status']}」，"
+            f"攻略必须提醒出行前核实开放状态并给出附近备选"
         )
     return "\n".join(lines)
 
@@ -408,6 +472,7 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
             "from": leg["from"], "to": leg["to"],
             "km": leg["km"], "hours": leg["hours"], "measured": leg["measured"],
             "is_return": is_return,
+            "split_hint": leg.get("split_hint"),
         })
         d += 1
         if not is_return:
@@ -417,7 +482,7 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
 
     return {
         "overview": " → ".join(seq_names),
-        "scaffold_md": _render_scaffold(days),
+        "scaffold_md": _render_scaffold(days, route.get("alerts") or []),
         "days": days,
     }
 
@@ -517,7 +582,7 @@ def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _render_scaffold(days: list[dict[str, Any]]) -> str:
+def _render_scaffold(days: list[dict[str, Any]], alerts: Optional[list[dict[str, str]]] = None) -> str:
     first = next((d for d in days if d["kind"] == "transfer"), None)
     last = next((d for d in reversed(days) if d["kind"] == "transfer"), None)
     dir_lock = ""
@@ -534,7 +599,8 @@ def _render_scaffold(days: list[dict[str, Any]]) -> str:
         "你必须为每天补一个主题名，并原样照抄城市与里程，禁止改动顺序、城市、里程、时长，"
         "禁止增加或删除任何一天，禁止反向。" + dir_lock +
         "请为每一天输出形如 "
-        "`### Day N · <你起的主题> · <下面锁定的城市与里程原样照抄>` 的小节标题。",
+        "`### Day N · <你起的主题> · <下面锁定的城市与里程原样照抄>` 的小节标题。"
+        "「↳」开头的行是对该天正文内容的附加要求，不要出现在标题里。",
         "",
     ]
     for day in days:
@@ -546,9 +612,19 @@ def _render_scaffold(days: list[dict[str, Any]]) -> str:
                 f"Day {day['day']} · 【主题待填】· {day['from']} → {day['to']} · "
                 f"约 {day['km']:.0f}km{est}{hours}{tail}"
             )
+            if day.get("split_hint"):
+                lines.append(
+                    f"　↳ 本段为全程长途驾驶日：该天提示列必须包含「每 2 小时进服务区休息」，"
+                    f"并明确建议「不想赶路可在 {day['split_hint']} 一带中途过夜、行程加 1 天」"
+                )
         else:
             lines.append(
                 f"Day {day['day']} · 【主题待填】· {day['at']} 深度游/休整 · "
                 f"0km（当地游览，无城际转移）"
             )
+    for alert in alerts or []:
+        lines.append(
+            f"　⚠️ 「{alert['stop']}」当前被高德标注为「{alert['status']}」：必须在对应 Day 的"
+            f"提示列和「避坑提示」板块中提醒读者出行前核实开放状态，并给出附近替代景点"
+        )
     return "\n".join(lines)
