@@ -105,7 +105,17 @@ _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出
 旅行需求：{query}"""
 
 
-async def plan_route(query: str, llm, fallback_llm=None) -> tuple[Optional[dict], str]:
+def _make_notify(on_progress):
+    def notify(msg: str) -> None:
+        if on_progress:
+            try:
+                on_progress(msg)
+            except Exception:
+                pass
+    return notify
+
+
+async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tuple[Optional[dict], str]:
     """规划多点自驾路线，返回 (route, status)。
 
     status: "ok" | "not_applicable"（单目的地/未配置 key）| "failed"
@@ -126,11 +136,12 @@ async def plan_route(query: str, llm, fallback_llm=None) -> tuple[Optional[dict]
     if not os.getenv("AMAP_WEB_SERVICE_KEY", "").strip():
         logger.info("未配置 AMAP_WEB_SERVICE_KEY，跳过路线规划")
         return None, "not_applicable"
+    notify = _make_notify(on_progress)
     for attempt in (1, 2):
         # 第 1 次用传入模型（通常是快速模型）；失手后重试换更稳的回退模型
         use_llm = llm if attempt == 1 or fallback_llm is None else fallback_llm
         try:
-            route, retryable = await _plan(query, use_llm)
+            route, retryable = await _plan(query, use_llm, notify)
         except Exception:
             logger.exception("路线规划第 %d 次尝试异常", attempt)
             route, retryable = None, True
@@ -156,11 +167,12 @@ async def plan_route_skeleton(query: str, llm) -> str:
     return route["markdown"] if route else ""
 
 
-async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
+async def _plan(query: str, llm, notify=lambda msg: None) -> tuple[Optional[dict], bool]:
     """返回 (route, retryable)。route 为 None 时 retryable 区分
     「值得重试的失败」（抽取输出不合法、高德瞬时故障）与「确实不适用」。"""
     key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
 
+    notify("正在从需求中抽取出发地与途经点...")
     extracted = await _extract_stops(query, llm)
     if not extracted:
         logger.warning("途经点抽取未返回合法 JSON")
@@ -186,6 +198,7 @@ async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         names = [origin] + stops
+        notify(f"已识别 {len(stops)} 个途经点，正在高德地图逐一定位...")
         located = await _geocode_all(client, key, names)
         if located[0] is None:
             # 出发地都定位不到，骨架无从谈起（多为高德瞬时故障，值得重试）
@@ -212,6 +225,7 @@ async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
         # 用真实驾车距离矩阵排序：山区路网与直线距离差异很大，直线最短
         # 环线常常不是驾车最短环线（会把顺路点排成折返）。矩阵拿不到时
         # 退回直线估算。
+        notify("定位完成，正在实测两两驾车距离并计算最短环线...")
         dist_km, dur_h, measured = await _driving_matrix(client, key, located_coords)
 
         if user_fixed_order:

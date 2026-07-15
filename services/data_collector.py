@@ -18,6 +18,8 @@ async def collect_travel_data(
     travelers: Optional[int] = None,
     budget: Optional[int] = None,
     is_international: bool = False,
+    on_progress=None,
+    deadline: float = 45.0,
 ) -> dict[str, str]:
     """根据用户需求并行采集旅行数据
 
@@ -63,39 +65,50 @@ async def collect_travel_data(
     tasks.append(("tips", tips_query))
 
     # 并行执行：携程问道四路查询 + 12306 + 高德参考数据一起并行，
-    # 避免外部接口把总耗时变成串行相加
+    # 避免外部接口把总耗时变成串行相加。整体设截止时间（deadline 秒），
+    # 到点未返回的数据源直接跳过（LLM 按"无实时数据"推算），保证生成
+    # 不被单个慢数据源拖住。on_progress(msg) 用于向前端播报各源完成情况。
     labels, queries = zip(*tasks)
-    query_many_coro = client.query_many(list(queries))
 
-    extra_coros = []
-    extra_labels = []
-    if org and dest:
-        extra_coros.append(_query_train_reference(org, dest))
-        extra_labels.append("train")
-    if dest:
-        extra_coros.append(_query_amap_reference(dest, org))
-        extra_labels.append("amap")
+    def _notify(msg: str) -> None:
+        if on_progress:
+            try:
+                on_progress(msg)
+            except Exception:
+                pass
 
-    gathered = await asyncio.gather(query_many_coro, *extra_coros)
-    results = gathered[0]
-    extras = {
-        label: result if isinstance(result, str) else ""
-        for label, result in zip(extra_labels, gathered[1:])
-    }
+    data = {label: "" for label in labels}
+    data["train"] = ""
+    data["amap"] = ""
 
-    # 聚合结果
-    data = {}
-    for label, result in zip(labels, results):
-        if isinstance(result, Exception):
+    async def run_wendao() -> None:
+        results = await client.query_many(list(queries))
+        for label, result in zip(labels, results):
             # 查询失败置空，让 LLM 按"无实时数据"处理，而不是把错误文本当数据
-            data[label] = ""
-        elif isinstance(result, str):
-            data[label] = result
-        else:
-            data[label] = str(result)
+            data[label] = result if isinstance(result, str) else ""
+        _notify("携程问道 · 交通/酒店/景点/贴士数据就绪")
 
-    data["train"] = extras.get("train", "")
-    data["amap"] = extras.get("amap", "")
+    async def run_train() -> None:
+        result = await _query_train_reference(org, dest)
+        data["train"] = result if isinstance(result, str) else ""
+        _notify("12306 余票参考数据就绪")
+
+    async def run_amap() -> None:
+        result = await _query_amap_reference(dest, org)
+        data["amap"] = result if isinstance(result, str) else ""
+        _notify("高德位置与周边数据就绪")
+
+    pending_tasks = [asyncio.create_task(run_wendao())]
+    if org and dest:
+        pending_tasks.append(asyncio.create_task(run_train()))
+    if dest:
+        pending_tasks.append(asyncio.create_task(run_amap()))
+
+    done, still_pending = await asyncio.wait(pending_tasks, timeout=deadline)
+    if still_pending:
+        for task in still_pending:
+            task.cancel()
+        _notify("部分数据源超时，已跳过（相应板块将由 AI 推算）")
 
     return data
 

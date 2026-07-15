@@ -181,36 +181,67 @@ class TravelGuideOrchestrator:
             {"type": "content", "data": "..."}   - 流式文本
             {"type": "error", "data": "..."}     - 错误
         """
-        # ---------- Phase 1: 实时数据采集 ----------
+        # ---------- Phase 1: 实时数据采集 + 路线规划（并行，滚动播报） ----------
         yield {"type": "progress", "data": "正在查询携程问道 · 机票酒店景点数据..."}
 
         travel_data = {}
         day_plan = None
+        route, plan_status = None, "failed"
         try:
             from services.data_collector import collect_travel_data
             from services.route_planner import plan_route, build_day_plan
 
-            # 路线规划与实时数据并行采集；规划内部自带重试与日志，失败返回 None
-            collected, plan_result = await asyncio.gather(
-                collect_travel_data(query),
-                plan_route(query, self.fast_llm, fallback_llm=self.llm),
-                return_exceptions=True,
-            )
-            if isinstance(collected, dict):
-                travel_data = collected
-            elif isinstance(collected, Exception):
-                yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(collected)[:60]}"}
+            # 各任务的内部进度通过队列上报，这里边等边转发成滚动字幕，
+            # 避免最长一步（问道查询）期间界面静止
+            status_q: asyncio.Queue = asyncio.Queue()
 
-            route, plan_status = plan_result if isinstance(plan_result, tuple) else (None, "failed")
+            def note(msg: str) -> None:
+                status_q.put_nowait(msg)
+
+            async def plan_and_scaffold():
+                # 规划 + 日程脚手架串成一个任务，与数据采集并行，
+                # 脚手架耗时被问道查询完全覆盖
+                r, s = await plan_route(query, self.fast_llm, fallback_llm=self.llm, on_progress=note)
+                dp = None
+                if r:
+                    note("路线骨架已锁定，正在分配每日行程节奏...")
+                    try:
+                        dp = await build_day_plan(query, r, self.fast_llm)
+                    except Exception:
+                        logging.getLogger("orchestrator").exception("日程脚手架生成异常，退化为仅注入路线骨架")
+                return r, s, dp
+
+            collect_task = asyncio.create_task(collect_travel_data(query, on_progress=note))
+            plan_task = asyncio.create_task(plan_and_scaffold())
+
+            import time
+            start = time.monotonic()
+            pending = {collect_task, plan_task}
+            while pending:
+                done, pending = await asyncio.wait(pending, timeout=3)
+                emitted = False
+                while not status_q.empty():
+                    yield {"type": "progress", "data": status_q.get_nowait()}
+                    emitted = True
+                if not emitted and pending:
+                    # 没有新事件也报个心跳，让用户知道后端在干活
+                    waiting = "携程问道数据" if collect_task in pending else "路线规划"
+                    yield {"type": "progress", "data": f"正在等待{waiting}返回...（已用时 {int(time.monotonic() - start)} 秒）"}
+            # 任务结束后清空剩余播报
+            while not status_q.empty():
+                yield {"type": "progress", "data": status_q.get_nowait()}
+
+            try:
+                travel_data = collect_task.result()
+            except Exception as e:
+                yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(e)[:60]}"}
+            try:
+                route, plan_status, day_plan = plan_task.result()
+            except Exception:
+                logging.getLogger("orchestrator").exception("路线规划任务异常")
+
             if route:
                 travel_data["route_plan"] = route["markdown"]
-                # 在锁定顺序上分配每日行程，产出脚手架——把路线顺序和里程从
-                # "提示词软约束"变成模型必须照填的硬结构，杜绝绕路/改序/编里程
-                try:
-                    day_plan = await build_day_plan(query, route, self.fast_llm)
-                except Exception:
-                    logging.getLogger("orchestrator").exception("日程脚手架生成异常，退化为仅注入路线骨架")
-                    day_plan = None
                 if day_plan:
                     travel_data["route_overview"] = day_plan["overview"]
                     travel_data["day_scaffold"] = day_plan["scaffold_md"]
