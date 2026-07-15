@@ -93,14 +93,14 @@ _EXTRACT_SYSTEM = (
 )
 
 _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出 JSON：
-{{"origin": "出发地", "stops": ["途经点1", "途经点2"], "user_fixed_order": false, "round_trip": true, "days": null}}
+{{"origin": "出发地", "origin_inferred": false, "stops": ["途经点1", "途经点2"], "user_fixed_order": false, "round_trip": true, "days": null}}
 
 - stops 是需要前往游玩的具体景点/目的地列表（不含出发地），每项写成「县市名+景点名」（如 "龙山县八面山"、"古丈县坐龙峡"），便于精确定位到景点本身而不是县城
 - 只有相距很近（同一景区、<20km）的景点才合并为一项；同县但相距较远的景点必须各自单独列出
 - 用户明确指定了游览顺序时 user_fixed_order 为 true，stops 按用户顺序排列
 - round_trip 默认为 true（自驾默认回出发地取/还车）；只有用户明确表示单程、异地还车、或以其他城市为终点时才为 false
 - 用户明确给出总天数（如"7天""十日游"）时 days 填该整数；给的是范围（如"7-10天"）取上限；未提及时为 null
-- 提取不到出发地时 origin 为 null
+- 用户明确写了出发地时 origin_inferred 为 false；**用户没写出发地时，根据途经点推断最合理的出发/集散城市**（通常是途经点所在省份的省会或最近的交通枢纽，如湖南景点群默认长沙），填入 origin 并把 origin_inferred 设为 true。只有连推断都不可能时 origin 才为 null
 
 旅行需求：{query}"""
 
@@ -170,6 +170,7 @@ async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
         logger.warning("多途经点但未识别出出发地: %r", extracted)
         return None, True
     user_fixed_order = bool(extracted.get("user_fixed_order"))
+    origin_inferred = bool(extracted.get("origin_inferred"))
     round_trip = extracted.get("round_trip", True) is not False
     try:
         days_budget = int(extracted.get("days")) if extracted.get("days") else None
@@ -234,6 +235,12 @@ async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
                 mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
                 leg["split_hint"] = await _regeo_city(client, key, mid)
 
+    markdown = _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts)
+    if origin_inferred:
+        markdown += (
+            f"\n（用户未指定出发地，已按途经点推断默认从 {origin} 出发；"
+            f"攻略「重要提示」中必须说明这一默认，并提示可按实际出发地调整）"
+        )
     return {
         "seq_names": seq_names,
         "legs": legs,
@@ -241,7 +248,9 @@ async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
         "alerts": alerts,
         "round_trip": round_trip,
         "days_budget": days_budget,
-        "markdown": _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts),
+        "origin_inferred": origin_inferred,
+        "origin": origin,
+        "markdown": markdown,
     }, True
 
 
@@ -566,6 +575,12 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
     # 标记返程段，再按用户天数预算合并相邻短段（"一天串多点"）
     legs = [dict(leg, is_return=(round_trip and i == len(legs) - 1))
             for i, leg in enumerate(legs)]
+    notes = []
+    if route.get("origin_inferred"):
+        notes.append(
+            f"用户未指定出发地，骨架已默认从 {route.get('origin')} 出发；"
+            f"「重要提示」中必须说明这一默认，并提示读者可按实际出发地调整。"
+        )
     budget_note = ""
     if days_budget and days_budget < len(legs):
         legs = _merge_legs_to_budget(legs, days_budget)
@@ -610,9 +625,11 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
                 days.append({"day": d, "kind": "stay", "at": leg["to"]})
                 d += 1
 
+    if budget_note:
+        notes.append(budget_note)
     return {
         "overview": " → ".join(seq_names),
-        "scaffold_md": _render_scaffold(days, route.get("alerts") or [], budget_note),
+        "scaffold_md": _render_scaffold(days, route.get("alerts") or [], "\n　⚠️ ".join(notes)),
         "days": days,
     }
 
