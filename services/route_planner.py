@@ -105,7 +105,7 @@ _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出
 旅行需求：{query}"""
 
 
-async def plan_route(query: str, llm) -> tuple[Optional[dict], str]:
+async def plan_route(query: str, llm, fallback_llm=None) -> tuple[Optional[dict], str]:
     """规划多点自驾路线，返回 (route, status)。
 
     status: "ok" | "not_applicable"（单目的地/未配置 key）| "failed"
@@ -127,8 +127,10 @@ async def plan_route(query: str, llm) -> tuple[Optional[dict], str]:
         logger.info("未配置 AMAP_WEB_SERVICE_KEY，跳过路线规划")
         return None, "not_applicable"
     for attempt in (1, 2):
+        # 第 1 次用传入模型（通常是快速模型）；失手后重试换更稳的回退模型
+        use_llm = llm if attempt == 1 or fallback_llm is None else fallback_llm
         try:
-            route, retryable = await _plan(query, llm)
+            route, retryable = await _plan(query, use_llm)
         except Exception:
             logger.exception("路线规划第 %d 次尝试异常", attempt)
             route, retryable = None, True
@@ -140,7 +142,10 @@ async def plan_route(query: str, llm) -> tuple[Optional[dict], str]:
             logger.info("路线规划不适用（单目的地等），交给常规流程")
             return None, "not_applicable"
         if attempt == 1:
-            logger.warning("路线规划第 1 次失败，重试一次")
+            logger.warning(
+                "路线规划第 1 次失败，%s重试",
+                "换回退模型" if fallback_llm is not None else "",
+            )
     logger.error("路线规划两次尝试均失败，本次报告将退化为纯 LLM 排线")
     return None, "failed"
 
@@ -264,11 +269,18 @@ async def _extract_stops(query: str, llm) -> Optional[dict]:
         text += chunk
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
+        logger.warning("抽取输出中没有 JSON 对象，原文: %r", text[:300])
         return None
+    payload = text[start:end + 1]
     try:
-        data = json.loads(text[start:end + 1])
+        data = json.loads(payload)
     except json.JSONDecodeError:
-        return None
+        # 小模型常见笔误：尾逗号。修复后再试一次
+        try:
+            data = json.loads(re.sub(r",\s*([}\]])", r"\1", payload))
+        except json.JSONDecodeError:
+            logger.warning("抽取 JSON 解析失败，原文: %r", payload[:300])
+            return None
     return data if isinstance(data, dict) else None
 
 
@@ -650,14 +662,17 @@ async def _allocate_stay_days(query: str, stop_names: list[str], llm) -> list[in
         ]):
             text += chunk
     except Exception:
+        logger.exception("停留天分配调用失败，全部按 0 处理")
         return fallback
 
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
+        logger.warning("停留天分配输出无 JSON，按 0 处理，原文: %r", text[:200])
         return fallback
     try:
         raw = json.loads(text[start:end + 1]).get("stay_days")
     except (json.JSONDecodeError, AttributeError):
+        logger.warning("停留天分配 JSON 解析失败，按 0 处理，原文: %r", text[start:end + 1][:200])
         return fallback
     if not isinstance(raw, list):
         return fallback

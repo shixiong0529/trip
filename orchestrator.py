@@ -193,7 +193,7 @@ class TravelGuideOrchestrator:
             # 路线规划与实时数据并行采集；规划内部自带重试与日志，失败返回 None
             collected, plan_result = await asyncio.gather(
                 collect_travel_data(query),
-                plan_route(query, self.fast_llm),
+                plan_route(query, self.fast_llm, fallback_llm=self.llm),
                 return_exceptions=True,
             )
             if isinstance(collected, dict):
