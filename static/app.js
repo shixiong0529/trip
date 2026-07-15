@@ -199,6 +199,11 @@
           state.progressSteps.push(payload);
           els.streamOutput.textContent = state.progressSteps.join('\n') + '\n\n';
           els.streamOutput.scrollTop = els.streamOutput.scrollHeight;
+        } else if (currentEvent === 'reset') {
+          // 服务端校验行程失败、按锁定顺序重新生成：清掉已展示的旧内容
+          state.guideMarkdown = '';
+          els.streamOutput.textContent = state.progressSteps.join('\n') + '\n\n';
+          els.streamOutput.scrollTop = els.streamOutput.scrollHeight;
         } else if (currentEvent === 'result') {
           try {
             const result = JSON.parse(payload);

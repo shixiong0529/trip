@@ -160,6 +160,10 @@ async def generate_guide(request: Request):
                         yield f"event: content\n{lines}\n\n"
                     elif event["type"] == "progress":
                         yield f"event: progress\ndata: {_sse_line(event['data'])}\n\n"
+                    elif event["type"] == "reset":
+                        # 锁定骨架校验失败重新生成：丢弃已累积内容，通知前端清屏
+                        full_markdown = ""
+                        yield "event: reset\ndata: \n\n"
                     elif event["type"] == "error":
                         yield f"event: error\ndata: {_sse_line(event['data'])}\n\n"
                         return
@@ -429,6 +433,12 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 # ---------- 首页 ----------
+@app.head("/")
+async def index_head():
+    """供监控器和安全扫描器探测首页，不返回响应正文。"""
+    return Response(status_code=200, media_type="text/html")
+
+
 @app.get("/")
 async def index():
     index_path = static_dir / "index.html"

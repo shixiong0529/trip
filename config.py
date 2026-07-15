@@ -20,6 +20,9 @@ class LLMConfig:
         # 8192 截断后触发自动续写(续写会让生成总时长接近翻倍)。
         # max_tokens 只是截断上限,按实际生成量计费,调大无额外成本
         self.max_tokens = int(os.getenv("LLM_MAX_TOKENS", "16384"))
+        # 途经点抽取、停留天分配等结构化小任务用的快速模型；
+        # 未配置时退回主模型。攻略正文始终用主模型生成
+        self.fast_model = os.getenv("LLM_FAST_MODEL", "").strip() or self.model
         # 结构化长报告优先保证格式稳定；较低温度减少标题、表格和代码块的
         # 随机变体，内容差异由用户需求和实时数据决定。
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
