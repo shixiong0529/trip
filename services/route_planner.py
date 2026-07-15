@@ -90,12 +90,13 @@ _EXTRACT_SYSTEM = (
 )
 
 _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出 JSON：
-{{"origin": "出发地", "stops": ["途经点1", "途经点2"], "user_fixed_order": false, "round_trip": true}}
+{{"origin": "出发地", "stops": ["途经点1", "途经点2"], "user_fixed_order": false, "round_trip": true, "days": null}}
 
 - stops 是需要前往游玩的具体景点/目的地列表（不含出发地），每项写成「县市名+景点名」（如 "龙山县八面山"、"古丈县坐龙峡"），便于精确定位到景点本身而不是县城
 - 只有相距很近（同一景区、<20km）的景点才合并为一项；同县但相距较远的景点必须各自单独列出
 - 用户明确指定了游览顺序时 user_fixed_order 为 true，stops 按用户顺序排列
 - round_trip 默认为 true（自驾默认回出发地取/还车）；只有用户明确表示单程、异地还车、或以其他城市为终点时才为 false
+- 用户明确给出总天数（如"7天""十日游"）时 days 填该整数；给的是范围（如"7-10天"）取上限；未提及时为 null
 - 提取不到出发地时 origin 为 null
 
 旅行需求：{query}"""
@@ -140,6 +141,12 @@ async def _plan(query: str, llm) -> Optional[dict]:
         return None
     user_fixed_order = bool(extracted.get("user_fixed_order"))
     round_trip = extracted.get("round_trip", True) is not False
+    try:
+        days_budget = int(extracted.get("days")) if extracted.get("days") else None
+    except (TypeError, ValueError):
+        days_budget = None
+    if days_budget is not None and not 1 <= days_budget <= _MAX_TOTAL_DAYS:
+        days_budget = None
 
     async with httpx.AsyncClient(timeout=20.0) as client:
         names = [origin] + stops
@@ -201,6 +208,7 @@ async def _plan(query: str, llm) -> Optional[dict]:
         "failed": failed,
         "alerts": alerts,
         "round_trip": round_trip,
+        "days_budget": days_budget,
         "markdown": _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts),
     }
 
@@ -421,6 +429,72 @@ def _format_skeleton(
 _MAX_STAY_PER_STOP = 3        # 单个途经点最多附加的深度游/休整天数
 _MAX_TOTAL_DAYS = 30          # 全程天数上限，防止模型给出离谱数字
 
+# 合并相邻转移段的安全余量（低于 800km/10h 硬上限，给游览留时间）
+_MERGE_MAX_KM = 750
+_MERGE_MAX_HOURS = 9.5
+
+
+def _merge_legs_to_budget(legs: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """用户天数少于转移段数时，把相邻短段合并成"一天串多点"。
+
+    贪心：每轮合并「合计里程最小」的相邻段对，直到段数 ≤ budget 或没有
+    可安全合并的段对（合计超过 _MERGE_MAX_KM/_MERGE_MAX_HOURS 不合并）。
+    合并后的段带 via 途经点列表。可能压不进 budget——调用方需处理。
+    """
+    merged = [dict(leg, via=list(leg.get("via") or [])) for leg in legs]
+
+    def combined(a: dict, b: dict) -> tuple[float, Optional[float]]:
+        km = a["km"] + b["km"]
+        hours = (
+            a["hours"] + b["hours"]
+            if a["hours"] is not None and b["hours"] is not None
+            else None
+        )
+        return km, hours
+
+    while len(merged) > budget:
+        best_i, best_km = None, float("inf")
+        for i in range(len(merged) - 1):
+            km, hours = combined(merged[i], merged[i + 1])
+            if km > _MERGE_MAX_KM or (hours or 0) > _MERGE_MAX_HOURS:
+                continue
+            if km < best_km:
+                best_km, best_i = km, i
+        if best_i is None:
+            break
+        a, b = merged[best_i], merged[best_i + 1]
+        km, hours = combined(a, b)
+        merged[best_i:best_i + 2] = [{
+            "from": a["from"],
+            "to": b["to"],
+            "via": a["via"] + [a["to"]] + b["via"],
+            "km": km,
+            "hours": hours,
+            "measured": a["measured"] and b["measured"],
+            "is_return": b.get("is_return", False),
+            "split_hint": b.get("split_hint") or a.get("split_hint"),
+        }]
+    return merged
+
+
+def _fit_stays_to_budget(stay_days: list[int], stays_total: int) -> list[int]:
+    """把停留天数调整到恰好 stays_total：超了从后往前削，缺了轮流补。"""
+    result = list(stay_days)
+    while sum(result) > stays_total:
+        for i in range(len(result) - 1, -1, -1):
+            if result[i] > 0:
+                result[i] -= 1
+                break
+    guard = 0
+    while sum(result) < stays_total and guard < stays_total * 2:
+        for i in range(len(result)):
+            if sum(result) >= stays_total:
+                break
+            if result[i] < _MAX_STAY_PER_STOP:
+                result[i] += 1
+        guard += 1
+    return result
+
 _DAYPLAN_SYSTEM = (
     "你是行程天数分配器，只输出一个 JSON 对象，禁止输出任何其他文字或代码块标记。"
 )
@@ -455,34 +529,58 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         return None
     if not legs:
         return None
+    days_budget = route.get("days_budget")
 
-    # 真实途经点（环线不含最后返程回到的出发地）
+    # 标记返程段，再按用户天数预算合并相邻短段（"一天串多点"）
+    legs = [dict(leg, is_return=(round_trip and i == len(legs) - 1))
+            for i, leg in enumerate(legs)]
+    budget_note = ""
+    if days_budget and days_budget < len(legs):
+        legs = _merge_legs_to_budget(legs, days_budget)
+        if len(legs) > days_budget:
+            # 安全驾驶上限内压不进用户天数：按最少可行天数排，并要求攻略说明
+            budget_note = (
+                f"用户要求 {days_budget} 天，但在单日驾驶安全上限内本路线最少需要 "
+                f"{len(legs)} 天。骨架已按最少可行天数排布，你必须在「重要提示」中"
+                f"说明该冲突并建议增加天数，禁止为凑天数压缩或删减途经点。"
+            )
+
+    # 真实途经点（环线不含最后返程回到的出发地；合并段的 via 途经点当天顺访，不单独过夜）
     n_stops = len(legs) - 1 if round_trip else len(legs)
     if n_stops < 1:
         return None
     stop_names = [legs[i]["to"] for i in range(n_stops)]
 
-    stay_days = await _allocate_stay_days(query, stop_names, llm)
+    if days_budget:
+        stays_total = max(0, min(days_budget, _MAX_TOTAL_DAYS) - len(legs))
+        if stays_total > 0:
+            stay_days = _fit_stays_to_budget(
+                await _allocate_stay_days(query, stop_names, llm), stays_total,
+            )
+        else:
+            stay_days = [0] * n_stops
+    else:
+        stay_days = await _allocate_stay_days(query, stop_names, llm)
 
     days, d = [], 1
     for i, leg in enumerate(legs):
-        is_return = round_trip and i == len(legs) - 1
         days.append({
             "day": d, "kind": "transfer",
             "from": leg["from"], "to": leg["to"],
+            "via": list(leg.get("via") or []),
             "km": leg["km"], "hours": leg["hours"], "measured": leg["measured"],
-            "is_return": is_return,
+            "is_return": leg.get("is_return", False),
             "split_hint": leg.get("split_hint"),
         })
         d += 1
-        if not is_return:
+        if not leg.get("is_return"):
             for _ in range(stay_days[i]):
                 days.append({"day": d, "kind": "stay", "at": leg["to"]})
                 d += 1
 
     return {
         "overview": " → ".join(seq_names),
-        "scaffold_md": _render_scaffold(days, route.get("alerts") or []),
+        "scaffold_md": _render_scaffold(days, route.get("alerts") or [], budget_note),
         "days": days,
     }
 
@@ -569,8 +667,9 @@ def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
         if day["kind"] == "transfer":
             if "→" not in seg:
                 return False, f"Day {day['day']} 应为转移日 {day['from']}→{day['to']}，标题却无转移"
-            left, right = [s.strip() for s in seg.split("→", 1)]
-            right = right.split("·")[0].strip()
+            # 串点日标题形如 A → B → C，只校验首尾端点
+            hops = [s.split("·")[0].strip() for s in seg.split("→")]
+            left, right = hops[0], hops[-1]
             if not (_cities_match(left, day["from"]) and _cities_match(right, day["to"])):
                 return False, (
                     f"Day {day['day']} 城市不符：应为 {day['from']}→{day['to']}，"
@@ -582,13 +681,18 @@ def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
     return True, ""
 
 
-def _render_scaffold(days: list[dict[str, Any]], alerts: Optional[list[dict[str, str]]] = None) -> str:
+def _render_scaffold(
+    days: list[dict[str, Any]],
+    alerts: Optional[list[dict[str, str]]] = None,
+    budget_note: str = "",
+) -> str:
     first = next((d for d in days if d["kind"] == "transfer"), None)
     last = next((d for d in reversed(days) if d["kind"] == "transfer"), None)
     dir_lock = ""
     if first and last:
+        first_path = " → ".join([first["from"]] + list(first.get("via") or []) + [first["to"]])
         dir_lock = (
-            f" Day 1 必须是「{first['from']} → {first['to']}」，"
+            f" Day 1 必须是「{first_path}」，"
             f"最后一个转移日必须是「{last['to']}"
             + ("（返程回到出发地）" if last.get("is_return") else "")
             + f"」；禁止把整条线路反向遍历，禁止丢掉返程段。"
@@ -603,15 +707,23 @@ def _render_scaffold(days: list[dict[str, Any]], alerts: Optional[list[dict[str,
         "「↳」开头的行是对该天正文内容的附加要求，不要出现在标题里。",
         "",
     ]
+    if budget_note:
+        lines.insert(2, "　⚠️ " + budget_note)
     for day in days:
         if day["kind"] == "transfer":
             hours = f" · 约 {day['hours']:.1f}h" if day["hours"] is not None else ""
             est = "" if day["measured"] else "（直线估算）"
             tail = "（返程回到出发地）" if day.get("is_return") else ""
+            path = " → ".join([day["from"]] + list(day.get("via") or []) + [day["to"]])
             lines.append(
-                f"Day {day['day']} · 【主题待填】· {day['from']} → {day['to']} · "
+                f"Day {day['day']} · 【主题待填】· {path} · "
                 f"约 {day['km']:.0f}km{est}{hours}{tail}"
             )
+            if day.get("via"):
+                lines.append(
+                    f"　↳ 本日为串点日：途中依次游览 {'、'.join(day['via'])}，"
+                    f"再抵达 {day['to']} 过夜；时段表须覆盖每个途经点的游览安排"
+                )
             if day.get("split_hint"):
                 lines.append(
                     f"　↳ 本段为全程长途驾驶日：该天提示列必须包含「每 2 小时进服务区休息」，"
