@@ -22,6 +22,14 @@ SYSTEM_PROMPT = """你是一位顶级的 AI 旅行规划师，名为「路小仙
 - **隧道/桥梁信息**：川藏线等施工活跃路段，必须检查关键隧道是否已通车（如觉巴山隧道已于 2025 年通车），走隧道是默认选项，老路标注为"可选体验"
 - **天数 vs 安全冲突**：如果总行程不满足安全驾驶天数，输出"建议增加天数"提示，**禁止强行压缩单日里程来凑天数**
 
+## 路线排序硬约束（多点行程必须严格遵守）
+
+- **单向推进**：途经点必须按地理位置排成单向环线或线形，禁止"路过 A 不停留、几天后再折回 A"，禁止任何 Z 字形折返
+- **游完即返**：最后一个景点游览完毕后，走最短路线直接返回出发地；**禁止在返程中加入未游览的中转城市过夜来凑天数**
+- **富余天数加深停留**：总天数多于景点所需时，把多出的天数用于在沿线目的地增加停留（深度游、休整），而不是增加绕路
+- **三处一致**：路线总览的途经顺序必须与分日行程完全一致；标题和关键统计声明的总天数必须严格等于分日行程的实际天数
+- 用户消息中若提供「路线骨架」，途经顺序与各段里程必须原样采用，禁止更改
+
 ## 事实准确性规则
 
 - **时间基准**：当前为 **2026 年 7 月**。所有价格标注当前年份（2026），禁止出现"2023-2024 年淡季"等过时锚定
@@ -222,6 +230,9 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
     """构建 User Message，注入可用的外部实时/准实时数据。"""
     travel_data = travel_data or {}
 
+    route_plan = travel_data.get("route_plan", "")
+    route_overview = travel_data.get("route_overview", "")
+    day_scaffold = travel_data.get("day_scaffold", "")
     transport = travel_data.get("transport", "")
     hotels = travel_data.get("hotels", "")
     attractions = travel_data.get("attractions", "")
@@ -246,7 +257,40 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
             data_context += f"\n【真实实用贴士】\n{tips}\n"
         data_context += "\n--- 数据结束 ---\n"
 
-    return f"""用户旅行需求：{query}{data_context}
+    route_block = ""
+    if day_scaffold:
+        # 有锁定脚手架时，分日行程的顺序与里程已由程序定死，模型只填内容。
+        # 这是把路线约束从"提示词软约束"变成"必须照填的硬结构"的关键。
+        route_block = f"""
+
+【路线总览 · 必须原样采用】
+{route_overview}
+
+{day_scaffold}
+
+强约束（违反即视为不合格）：
+- 「分日行程」必须与上面锁定骨架逐天一一对应：Day 数量、每天的城市/路线、里程、时长必须完全一致，禁止增删天数、禁止调整顺序、禁止改动里程
+- 「路线总览」板块必须原样使用上面给定的一行
+- 关键统计里的总天数 = 锁定骨架的天数；总里程 = 各转移段里程之和
+- 你只需为每天补主题名、填写时段活动表格、亮点与本日预算
+"""
+    elif route_plan:
+        route_block = f"""
+
+【路线骨架 · 硬约束】
+{route_plan}
+
+- 路线总览与分日行程必须严格按上述顺序推进，禁止调整顺序、禁止折返
+- 各段里程与驾驶时长直接采用上表实测值
+- 天数多于途经点时，多出的天数用于在沿线目的地增加停留，禁止用绕路或回头路凑天数
+"""
+
+    scaffold_reminder = (
+        "\n- 分日行程严格照「锁定骨架」逐天填充，不得改动标题里的城市与里程，不得增删天数"
+        if day_scaffold else ""
+    )
+
+    return f"""用户旅行需求：{query}{route_block}{data_context}
 
 请严格按照 System Prompt 的输出规范，生成一份极其详尽的旅游攻略：
 - 携程实时数据中的具体价格、酒店名、门票规则直接引用
@@ -254,5 +298,5 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
 - 避坑提示每条都要有具体数字，不能泛泛而谈
 - 物品清单写出具体数量
 - 分日行程中，每一天必须单独成节（不允许合并成"Day 5-6"）
-- 每天必须包含至少 4-5 行具体时段安排，自驾行程标题必须标注当日里程和驾驶时长
+- 每天必须包含至少 4-5 行具体时段安排，自驾行程标题必须标注当日里程和驾驶时长{scaffold_reminder}
 - 10 个板块必须全部输出"""

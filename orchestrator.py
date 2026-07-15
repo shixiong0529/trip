@@ -113,6 +113,35 @@ class TravelGuideOrchestrator:
             temperature=llm_config.temperature,
         )
 
+    @staticmethod
+    def _correction_prompt(reason: str, day_plan: dict) -> str:
+        """分日顺序不符时的纠正指令：点名问题 + 重贴锁定骨架，要求整篇重写。"""
+        return (
+            f"你上一版的分日行程不符合锁定骨架：{reason}。\n"
+            "请严格重写整篇攻略。分日行程必须与下面的锁定骨架逐天一一对应："
+            "Day 数量、每天的城市/路线、里程、时长完全一致，禁止反向遍历，"
+            "禁止增删天数，禁止改动里程。「路线总览」必须原样使用给定的一行。\n\n"
+            f"【路线总览 · 必须原样采用】\n{day_plan['overview']}\n\n"
+            f"{day_plan['scaffold_md']}"
+        )
+
+    async def _collect(self, messages: list[dict]) -> str:
+        """整篇生成（含一轮截断续写），不逐块外发，返回完整文本。
+
+        用于需要"先生成、后校验、必要时重生成"的锁定骨架路径。
+        """
+        full = ""
+        async for content in self.llm.chat_stream(messages):
+            full += content
+        if self.llm.last_finish_reason == "length":
+            continue_messages = messages + [
+                {"role": "assistant", "content": full},
+                {"role": "user", "content": "继续输出剩余内容，从中断处无缝续写，不要重复任何已输出内容，不要加任何过渡语。"},
+            ]
+            async for content in self.llm.chat_stream(continue_messages):
+                full += content
+        return full
+
     async def generate(self, query: str) -> AsyncGenerator[dict, None]:
         """两阶段生成攻略
 
@@ -128,9 +157,36 @@ class TravelGuideOrchestrator:
         yield {"type": "progress", "data": "正在查询携程问道 · 机票酒店景点数据..."}
 
         travel_data = {}
+        day_plan = None
         try:
             from services.data_collector import collect_travel_data
-            travel_data = await collect_travel_data(query)
+            from services.route_planner import plan_route, build_day_plan
+
+            # 路线规划与实时数据并行采集；规划内部自兜底，失败返回 None
+            collected, route = await asyncio.gather(
+                collect_travel_data(query),
+                plan_route(query, self.llm),
+                return_exceptions=True,
+            )
+            if isinstance(collected, dict):
+                travel_data = collected
+            elif isinstance(collected, Exception):
+                yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(collected)[:60]}"}
+
+            if isinstance(route, dict):
+                travel_data["route_plan"] = route["markdown"]
+                # 在锁定顺序上分配每日行程，产出脚手架——把路线顺序和里程从
+                # "提示词软约束"变成模型必须照填的硬结构，杜绝绕路/改序/编里程
+                try:
+                    day_plan = await build_day_plan(query, route, self.llm)
+                except Exception:
+                    day_plan = None
+                if day_plan:
+                    travel_data["route_overview"] = day_plan["overview"]
+                    travel_data["day_scaffold"] = day_plan["scaffold_md"]
+                    yield {"type": "progress", "data": "多点路线已按地图实测距离排定，并锁定每日行程骨架..."}
+                else:
+                    yield {"type": "progress", "data": "多点路线已按地图实测距离排定最短环线..."}
         except Exception as e:
             # 数据采集失败不影响后续流程，退化为纯 LLM 生成
             yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(e)[:60]}"}
@@ -147,44 +203,70 @@ class TravelGuideOrchestrator:
         ]
 
         try:
-            first_chunk = True
-            buffer = ""
-            full_content = ""
-            async for content in self.llm.chat_stream(messages):
-                buffer += content
-                full_content += content
-                if first_chunk:
-                    yield {"type": "progress", "data": "AI 正在生成详细攻略..."}
-                    first_chunk = False
-                # 每积累 200 字符或遇到换行就发送
-                if len(buffer) >= 200 or "\n" in buffer:
-                    yield {"type": "content", "data": buffer}
-                    buffer = ""
-            # 发送剩余缓冲
-            if buffer:
-                yield {"type": "content", "data": buffer}
+            if day_plan:
+                # 锁定骨架路径：先整篇生成 → 校验分日顺序 → 不符则带原因重生成一次
+                # → 校验通过后再整篇下发。把"路线顺序"从提示词软约束升级为程序硬校验。
+                from services.route_planner import validate_day_sequence
 
-            # 输出被截断（finish_reason == "length"）时自动续写一轮，避免攻略戛然而止
-            if self.llm.last_finish_reason == "length":
-                yield {"type": "progress", "data": "输出较长，正在自动续写..."}
-                continue_messages = messages + [
-                    {"role": "assistant", "content": full_content},
-                    {
-                        "role": "user",
-                        "content": "继续输出剩余内容，从中断处无缝续写，不要重复任何已输出内容，不要加任何过渡语。",
-                    },
-                ]
+                yield {"type": "progress", "data": "AI 正在按锁定行程骨架生成攻略..."}
+                full_content = await self._collect(messages)
+                ok, reason = validate_day_sequence(full_content, day_plan)
+                if not ok:
+                    yield {"type": "progress", "data": f"行程与锁定顺序不符（{reason}），正在按锁定顺序重排..."}
+                    correction = messages + [
+                        {"role": "assistant", "content": full_content},
+                        {"role": "user", "content": self._correction_prompt(reason, day_plan)},
+                    ]
+                    full_content = await self._collect(correction)
+                    ok, _ = validate_day_sequence(full_content, day_plan)
+                    if not ok:
+                        yield {"type": "progress", "data": "已尽力对齐锁定顺序，按最接近的一版输出..."}
+
+                yield {"type": "progress", "data": "AI 正在生成详细攻略..."}
+                # 校验后一次性下发（分块只为前端渐进渲染）
+                for i in range(0, len(full_content), 400):
+                    yield {"type": "content", "data": full_content[i:i + 400]}
+                yield {"type": "progress", "data": "正在生成精美文档..."}
+
+            else:
+                first_chunk = True
                 buffer = ""
-                async for content in self.llm.chat_stream(continue_messages):
+                full_content = ""
+                async for content in self.llm.chat_stream(messages):
                     buffer += content
+                    full_content += content
+                    if first_chunk:
+                        yield {"type": "progress", "data": "AI 正在生成详细攻略..."}
+                        first_chunk = False
+                    # 每积累 200 字符或遇到换行就发送
                     if len(buffer) >= 200 or "\n" in buffer:
                         yield {"type": "content", "data": buffer}
                         buffer = ""
+                # 发送剩余缓冲
                 if buffer:
                     yield {"type": "content", "data": buffer}
-                # 续写轮 finish_reason 仍为 "length" 也不再继续（最多续写 1 轮）
 
-            yield {"type": "progress", "data": "正在生成精美文档..."}
+                # 输出被截断（finish_reason == "length"）时自动续写一轮，避免攻略戛然而止
+                if self.llm.last_finish_reason == "length":
+                    yield {"type": "progress", "data": "输出较长，正在自动续写..."}
+                    continue_messages = messages + [
+                        {"role": "assistant", "content": full_content},
+                        {
+                            "role": "user",
+                            "content": "继续输出剩余内容，从中断处无缝续写，不要重复任何已输出内容，不要加任何过渡语。",
+                        },
+                    ]
+                    buffer = ""
+                    async for content in self.llm.chat_stream(continue_messages):
+                        buffer += content
+                        if len(buffer) >= 200 or "\n" in buffer:
+                            yield {"type": "content", "data": buffer}
+                            buffer = ""
+                    if buffer:
+                        yield {"type": "content", "data": buffer}
+                    # 续写轮 finish_reason 仍为 "length" 也不再继续（最多续写 1 轮）
+
+                yield {"type": "progress", "data": "正在生成精美文档..."}
 
         except LLMClientError as e:
             yield {"type": "error", "data": str(e)}
