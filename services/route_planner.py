@@ -15,10 +15,13 @@
 import asyncio
 import itertools
 import json
+import logging
 import math
 import os
 import re
 from typing import Any, Optional
+
+logger = logging.getLogger("route_planner")
 
 import httpx
 from dotenv import load_dotenv
@@ -102,43 +105,70 @@ _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出
 旅行需求：{query}"""
 
 
-async def plan_route(query: str, llm) -> Optional[dict]:
-    """规划多点自驾路线，返回结构化结果；不适用或失败时返回 None。
+async def plan_route(query: str, llm) -> tuple[Optional[dict], str]:
+    """规划多点自驾路线，返回 (route, status)。
 
-    返回 dict:
+    status: "ok" | "not_applicable"（单目的地/未配置 key）| "failed"
+
+    route dict:
         seq_names: 有序途经点（含出发地，环线含返程回到出发地）
         legs:      [{from,to,km,hours,measured}...]，长度 = len(seq_names)-1
         failed:    未能定位、未纳入排序的点
         round_trip: 是否回到出发地
+        days_budget: 用户明确要求的总天数（未提及为 None）
         markdown:  可直接注入的「路线骨架」表格
+
+    整份报告的路线质量都压在这一步上，所以可重试的失败（抽取输出不合法、
+    高德瞬时故障）自动重试一次，并把每次失败写日志——绝不允许静默失效。
 
     llm 需提供 chat_stream(messages) 异步生成器（orchestrator.LLMClient）。
     """
-    try:
-        return await _plan(query, llm)
-    except Exception:
-        return None
+    if not os.getenv("AMAP_WEB_SERVICE_KEY", "").strip():
+        logger.info("未配置 AMAP_WEB_SERVICE_KEY，跳过路线规划")
+        return None, "not_applicable"
+    for attempt in (1, 2):
+        try:
+            route, retryable = await _plan(query, llm)
+        except Exception:
+            logger.exception("路线规划第 %d 次尝试异常", attempt)
+            route, retryable = None, True
+        if route:
+            if attempt > 1:
+                logger.info("路线规划重试成功")
+            return route, "ok"
+        if not retryable:
+            logger.info("路线规划不适用（单目的地等），交给常规流程")
+            return None, "not_applicable"
+        if attempt == 1:
+            logger.warning("路线规划第 1 次失败，重试一次")
+    logger.error("路线规划两次尝试均失败，本次报告将退化为纯 LLM 排线")
+    return None, "failed"
 
 
 async def plan_route_skeleton(query: str, llm) -> str:
     """兼容旧接口：只取路线骨架 Markdown，失败返回空串。"""
-    route = await plan_route(query, llm)
+    route, _ = await plan_route(query, llm)
     return route["markdown"] if route else ""
 
 
-async def _plan(query: str, llm) -> Optional[dict]:
+async def _plan(query: str, llm) -> tuple[Optional[dict], bool]:
+    """返回 (route, retryable)。route 为 None 时 retryable 区分
+    「值得重试的失败」（抽取输出不合法、高德瞬时故障）与「确实不适用」。"""
     key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
-    if not key:
-        return ""
 
     extracted = await _extract_stops(query, llm)
     if not extracted:
-        return ""
+        logger.warning("途经点抽取未返回合法 JSON")
+        return None, True
     origin = (extracted.get("origin") or "").strip()
     stops = [s.strip() for s in extracted.get("stops") or [] if s and s.strip()]
-    if not origin or len(stops) < 2:
+    if len(stops) < 2:
         # 单目的地不存在排序问题，交给既有的高德参考数据即可
-        return None
+        return None, False
+    if not origin:
+        # 多途经点却没识别出出发地，多半是抽取偶发漏抽，值得重试
+        logger.warning("多途经点但未识别出出发地: %r", extracted)
+        return None, True
     user_fixed_order = bool(extracted.get("user_fixed_order"))
     round_trip = extracted.get("round_trip", True) is not False
     try:
@@ -152,8 +182,9 @@ async def _plan(query: str, llm) -> Optional[dict]:
         names = [origin] + stops
         located = await _geocode_all(client, key, names)
         if located[0] is None:
-            # 出发地都定位不到，骨架无从谈起
-            return None
+            # 出发地都定位不到，骨架无从谈起（多为高德瞬时故障，值得重试）
+            logger.warning("出发地定位失败: %s", origin)
+            return None, True
 
         located_names, located_coords, poi_names, failed = [], [], [], []
         for name, item in zip(names, located):
@@ -165,7 +196,8 @@ async def _plan(query: str, llm) -> Optional[dict]:
                 failed.append(name)
         # 除出发地外至少要有 2 个可定位途经点才有排序价值
         if len(located_coords) < 3:
-            return None
+            logger.warning("可定位途经点不足: 成功 %s / 失败 %s", located_names, failed)
+            return None, True
 
         # 高德 POI 名里的状态标注（如「坐龙峡风景区(暂停开放)」）提出来，
         # 让攻略主动提醒核实，而不是当它不存在
@@ -210,7 +242,7 @@ async def _plan(query: str, llm) -> Optional[dict]:
         "round_trip": round_trip,
         "days_budget": days_budget,
         "markdown": _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts),
-    }
+    }, True
 
 
 async def _extract_stops(query: str, llm) -> Optional[dict]:

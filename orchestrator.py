@@ -8,9 +8,10 @@ AI 编排层 v2.0
   GET /api/flights/search  — 国际机票查询，Google Flights（?origin&destination&date&nonstop&passengers）
 """
 
-import json
-import httpx
 import asyncio
+import json
+import logging
+import httpx
 from typing import AsyncGenerator
 
 from prompts import SYSTEM_PROMPT, build_user_message
@@ -162,8 +163,8 @@ class TravelGuideOrchestrator:
             from services.data_collector import collect_travel_data
             from services.route_planner import plan_route, build_day_plan
 
-            # 路线规划与实时数据并行采集；规划内部自兜底，失败返回 None
-            collected, route = await asyncio.gather(
+            # 路线规划与实时数据并行采集；规划内部自带重试与日志，失败返回 None
+            collected, plan_result = await asyncio.gather(
                 collect_travel_data(query),
                 plan_route(query, self.llm),
                 return_exceptions=True,
@@ -173,13 +174,15 @@ class TravelGuideOrchestrator:
             elif isinstance(collected, Exception):
                 yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(collected)[:60]}"}
 
-            if isinstance(route, dict):
+            route, plan_status = plan_result if isinstance(plan_result, tuple) else (None, "failed")
+            if route:
                 travel_data["route_plan"] = route["markdown"]
                 # 在锁定顺序上分配每日行程，产出脚手架——把路线顺序和里程从
                 # "提示词软约束"变成模型必须照填的硬结构，杜绝绕路/改序/编里程
                 try:
                     day_plan = await build_day_plan(query, route, self.llm)
                 except Exception:
+                    logging.getLogger("orchestrator").exception("日程脚手架生成异常，退化为仅注入路线骨架")
                     day_plan = None
                 if day_plan:
                     travel_data["route_overview"] = day_plan["overview"]
@@ -187,6 +190,9 @@ class TravelGuideOrchestrator:
                     yield {"type": "progress", "data": "多点路线已按地图实测距离排定，并锁定每日行程骨架..."}
                 else:
                     yield {"type": "progress", "data": "多点路线已按地图实测距离排定最短环线..."}
+            elif plan_status == "failed":
+                # 规划失败对路线质量影响很大，必须让用户可见，而不是静默降级
+                yield {"type": "progress", "data": "⚠️ 多点路线规划未生效，本次路线顺序由 AI 自行推算，建议重新生成一次..."}
         except Exception as e:
             # 数据采集失败不影响后续流程，退化为纯 LLM 生成
             yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(e)[:60]}"}
