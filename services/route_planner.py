@@ -313,7 +313,21 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
     }
 
 
+# LLM 小任务的时限：正常几秒返回；API 拥堵时（httpx 层超时长达 120s）
+# 不能让一次抽取把整个规划挂住——超时按失败处理，走既有回退链
+_EXTRACT_TIMEOUT = 30.0
+_STAY_ALLOC_TIMEOUT = 25.0
+
+
 async def _extract_stops(query: str, llm) -> Optional[dict]:
+    try:
+        return await asyncio.wait_for(_extract_stops_inner(query, llm), _EXTRACT_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("途经点抽取超时（%.0fs）", _EXTRACT_TIMEOUT)
+        return None
+
+
+async def _extract_stops_inner(query: str, llm) -> Optional[dict]:
     messages = [
         {"role": "system", "content": _EXTRACT_SYSTEM},
         {"role": "user", "content": _EXTRACT_TEMPLATE.format(query=query)},
@@ -732,13 +746,20 @@ async def _allocate_stay_days(query: str, stop_names: list[str], llm) -> list[in
     prompt = _DAYPLAN_TEMPLATE.format(
         stops_line=stops_line, zeros=", ".join(["0"] * n), n=n, query=query,
     )
-    text = ""
-    try:
+    async def run() -> str:
+        collected = ""
         async for chunk in llm.chat_stream([
             {"role": "system", "content": _DAYPLAN_SYSTEM},
             {"role": "user", "content": prompt},
         ]):
-            text += chunk
+            collected += chunk
+        return collected
+
+    try:
+        text = await asyncio.wait_for(run(), _STAY_ALLOC_TIMEOUT)
+    except asyncio.TimeoutError:
+        logger.warning("停留天分配超时（%.0fs），全部按 0 处理", _STAY_ALLOC_TIMEOUT)
+        return fallback
     except Exception:
         logger.exception("停留天分配调用失败，全部按 0 处理")
         return fallback

@@ -212,7 +212,9 @@ class TravelGuideOrchestrator:
                 return r, s, dp
 
             collect_task = asyncio.create_task(collect_travel_data(query, on_progress=note))
-            plan_task = asyncio.create_task(plan_and_scaffold())
+            # 规划整体设 90s 兜底上限：内部各 LLM 小调用已有 25-30s 超时，
+            # 正常远够用；万一 API 拥堵挂起，宁可降级也不能让页面无限等待
+            plan_task = asyncio.create_task(asyncio.wait_for(plan_and_scaffold(), timeout=90.0))
 
             import time
             start = time.monotonic()
@@ -237,6 +239,8 @@ class TravelGuideOrchestrator:
                 yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(e)[:60]}"}
             try:
                 route, plan_status, day_plan = plan_task.result()
+            except asyncio.TimeoutError:
+                logging.getLogger("orchestrator").error("路线规划超时（90s），降级为纯 LLM 排线")
             except Exception:
                 logging.getLogger("orchestrator").exception("路线规划任务异常")
 
