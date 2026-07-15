@@ -711,37 +711,61 @@ def _cities_match(a: str, b: str) -> bool:
     return bool(a) and bool(b) and (a in b or b in a)
 
 
-def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
-    """校验成稿的分日标题是否与锁定骨架逐天一致。
+def _match_day(text: str, day: dict) -> tuple[bool, str]:
+    """比对一条 Day 标题与骨架中的对应天。只看城市转移/停留，不纠结主题名。"""
+    # 取标题中含「→」或「深度游/休整」的那一段做地名比对
+    seg = next(
+        (p for p in text.split("·") if "→" in p or "深度游" in p or "休整" in p),
+        text,
+    )
+    if day["kind"] == "transfer":
+        if "→" not in seg:
+            return False, f"Day {day['day']} 应为转移日 {day['from']}→{day['to']}，标题却无转移"
+        # 串点日标题形如 A → B → C，只校验首尾端点
+        hops = [s.split("·")[0].strip() for s in seg.split("→")]
+        left, right = hops[0], hops[-1]
+        if not (_cities_match(left, day["from"]) and _cities_match(right, day["to"])):
+            return False, (
+                f"Day {day['day']} 城市不符：应为 {day['from']}→{day['to']}，"
+                f"实际 {left}→{right}"
+            )
+    else:  # stay
+        if not _cities_match(seg, day["at"]):
+            return False, f"Day {day['day']} 应为 {day['at']} 停留日，标题不符"
+    return True, ""
 
-    返回 (是否通过, 不一致原因)。只比对天数、每天的城市转移/停留，
-    不纠结主题名与文案。
-    """
+
+def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
+    """校验成稿的分日标题是否与锁定骨架逐天一致。返回 (是否通过, 原因)。"""
     expected = day_plan.get("days") or []
     headers = _DAY_HEADER_RE.findall(markdown)
     if len(headers) != len(expected):
         return False, f"天数不符：应为 {len(expected)} 天，实际 {len(headers)} 天"
+    for (_num, text), day in zip(headers, expected):
+        ok, reason = _match_day(text, day)
+        if not ok:
+            return False, reason
+    return True, ""
 
-    for (num, text), day in zip(headers, expected):
-        # 取标题中含「→」或「深度游/休整」的那一段做地名比对
-        seg = next(
-            (p for p in text.split("·") if "→" in p or "深度游" in p or "休整" in p),
-            text,
-        )
-        if day["kind"] == "transfer":
-            if "→" not in seg:
-                return False, f"Day {day['day']} 应为转移日 {day['from']}→{day['to']}，标题却无转移"
-            # 串点日标题形如 A → B → C，只校验首尾端点
-            hops = [s.split("·")[0].strip() for s in seg.split("→")]
-            left, right = hops[0], hops[-1]
-            if not (_cities_match(left, day["from"]) and _cities_match(right, day["to"])):
-                return False, (
-                    f"Day {day['day']} 城市不符：应为 {day['from']}→{day['to']}，"
-                    f"实际 {left}→{right}"
-                )
-        else:  # stay
-            if not _cities_match(seg, day["at"]):
-                return False, f"Day {day['day']} 应为 {day['at']} 停留日，标题不符"
+
+def check_day_sequence_prefix(markdown: str, day_plan: dict) -> tuple[bool, str]:
+    """增量校验：只比对已完整出现的 Day 标题，供流式生成时尽早发现偏离。
+
+    返回 (前缀是否仍符合, 不符原因)。偏离在标题流出的那一刻即可判定，
+    调用方可立即中断本次生成，省掉把错误版本写完的时间。
+    """
+    expected = day_plan.get("days") or []
+    # 只扫描到最后一个完整行，半行标题不参与判定
+    cut = markdown.rfind("\n")
+    if cut < 0:
+        return True, ""
+    headers = _DAY_HEADER_RE.findall(markdown[:cut + 1])
+    if len(headers) > len(expected):
+        return False, f"Day 数量超出骨架（应为 {len(expected)} 天）"
+    for (_num, text), day in zip(headers, expected):
+        ok, reason = _match_day(text, day)
+        if not ok:
+            return False, reason
     return True, ""
 
 

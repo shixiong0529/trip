@@ -237,21 +237,40 @@ class TravelGuideOrchestrator:
 
         try:
             if day_plan:
-                # 锁定骨架路径：实时流式生成 → 流结束后校验分日顺序 → 不符则
-                # 发 reset 清屏、带原因重生成一次。把"路线顺序"从提示词软约束
-                # 升级为程序硬校验，同时保住"边生成边看"的体验。
-                from services.route_planner import validate_day_sequence
+                # 锁定骨架路径：实时流式生成 + 逐块增量校验分日顺序。
+                # 第 1 版一旦偏离立即掐断（不等错误版本写完），reset 清屏后
+                # 带原因重生成；第 2 版必须完整输出，避免报告被截断。
+                from services.route_planner import validate_day_sequence, check_day_sequence_prefix
 
+                log = logging.getLogger("orchestrator")
                 attempt_messages = messages
                 for attempt in (1, 2):
                     yield {"type": "progress", "data": "AI 正在按锁定行程骨架生成攻略..."}
                     sink = {}
-                    async for event in self._stream_events(attempt_messages, sink):
-                        yield event
-                    full_content = sink.get("content", "")
-                    ok, reason = validate_day_sequence(full_content, day_plan)
+                    streamed = ""
+                    early_reason = None
+                    agen = self._stream_events(attempt_messages, sink)
+                    try:
+                        async for event in agen:
+                            yield event
+                            if event["type"] != "content" or attempt > 1:
+                                continue
+                            streamed += event["data"]
+                            ok, reason = check_day_sequence_prefix(streamed, day_plan)
+                            if not ok:
+                                early_reason = reason
+                                break
+                    finally:
+                        await agen.aclose()
+
+                    full_content = sink.get("content", streamed)
+                    if early_reason is not None:
+                        ok, reason = False, early_reason
+                    else:
+                        ok, reason = validate_day_sequence(full_content, day_plan)
                     if ok:
                         break
+                    log.warning("锁定骨架校验失败（第 %d 版）: %s", attempt, reason)
                     if attempt == 1:
                         yield {"type": "reset"}
                         yield {"type": "progress", "data": f"行程与锁定顺序不符（{reason}），正在按锁定顺序重新生成..."}
