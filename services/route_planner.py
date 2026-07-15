@@ -363,14 +363,30 @@ def _route_cost(dist: list[list[float]], order: list[int], round_trip: bool) -> 
     return cost
 
 
+def _canonical_direction(dist: list[list[float]], order: list[int], round_trip: bool) -> list[int]:
+    """环线两个方向总里程几乎相同时（非对称路网差异 <2%），固定取
+    「返程段更短」的方向：最后一天返程最累，里程短更安全，也避免
+    同一需求两次生成方向随机翻转。"""
+    if not round_trip or len(order) < 2:
+        return order
+    rev = list(reversed(order))
+    if (
+        _route_cost(dist, rev, True) <= _route_cost(dist, order, True) * 1.02
+        and dist[rev[-1]][0] < dist[order[-1]][0]
+    ):
+        return rev
+    return order
+
+
 def _best_order(dist: list[list[float]], round_trip: bool) -> list[int]:
     """求从 0 号点（出发地）出发遍历所有途经点的最短顺序。"""
     idxs = list(range(1, len(dist)))
     if len(idxs) <= _BRUTE_FORCE_LIMIT:
-        return list(min(
+        best = list(min(
             itertools.permutations(idxs),
             key=lambda p: _route_cost(dist, list(p), round_trip),
         ))
+        return _canonical_direction(dist, best, round_trip)
 
     # 贪心最近邻起步
     order, remaining, cur = [], set(idxs), 0
@@ -389,7 +405,7 @@ def _best_order(dist: list[list[float]], round_trip: bool) -> list[int]:
                 if _route_cost(dist, candidate, round_trip) < _route_cost(dist, order, round_trip):
                     order = candidate
                     improved = True
-    return order
+    return _canonical_direction(dist, order, round_trip)
 
 
 async def _driving_matrix(
