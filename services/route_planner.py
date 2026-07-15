@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import re
+import time
 from typing import Any, Optional
 
 logger = logging.getLogger("route_planner")
@@ -35,6 +36,31 @@ load_dotenv()
 _AMAP_MIN_INTERVAL = 0.35
 _AMAP_RETRY_BACKOFF = 0.8
 _amap_lock = asyncio.Lock()
+
+# 规划结果缓存：同一需求短时间内重复生成（用户重试/微调很常见）时
+# 直接复用路线骨架与日程脚手架，Phase 1 的规划耗时归零
+_PLAN_CACHE_TTL = 7200
+_PLAN_CACHE_MAX = 32
+_route_cache: dict[str, tuple[float, Any]] = {}
+_dayplan_cache: dict[str, tuple[float, Any]] = {}
+
+
+def _cache_get(cache: dict, key: str):
+    item = cache.get(key)
+    if not item:
+        return None
+    ts, value = item
+    if time.time() - ts > _PLAN_CACHE_TTL:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_put(cache: dict, key: str, value) -> None:
+    if len(cache) >= _PLAN_CACHE_MAX:
+        oldest = min(cache, key=lambda k: cache[k][0])
+        cache.pop(oldest, None)
+    cache[key] = (time.time(), value)
 
 
 async def _amap_paced(call):
@@ -137,27 +163,52 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
         logger.info("未配置 AMAP_WEB_SERVICE_KEY，跳过路线规划")
         return None, "not_applicable"
     notify = _make_notify(on_progress)
+
+    cached = _cache_get(_route_cache, query)
+    if cached is not None:
+        notify("同一需求近期已规划过，直接复用路线骨架...")
+        return cached
+
+    # ---- 阶段一：途经点抽取。快速模型失手只重抽这一步（换回退模型），
+    # 不再把已成功的地图管线整个重跑 ----
+    notify("正在从需求中抽取出发地与途经点...")
+    extracted = await _extract_stops(query, llm)
+    if extracted is None and fallback_llm is not None:
+        logger.warning("快速模型抽取失败，换回退模型重抽")
+        notify("途经点抽取失败，正在换主模型重试...")
+        extracted = await _extract_stops(query, fallback_llm)
+    if extracted is None:
+        logger.error("途经点抽取两次均失败，本次报告将退化为纯 LLM 排线")
+        return None, "failed"
+
+    origin = (extracted.get("origin") or "").strip()
+    stops = [s.strip() for s in extracted.get("stops") or [] if s and s.strip()]
+    if len(stops) < 2:
+        # 单目的地不存在排序问题，交给既有的高德参考数据即可
+        logger.info("路线规划不适用（单目的地），交给常规流程")
+        result = (None, "not_applicable")
+        _cache_put(_route_cache, query, result)
+        return result
+    if not origin:
+        logger.warning("多途经点但未识别出出发地（含推断）: %r", extracted)
+        return None, "failed"
+
+    # ---- 阶段二：地图管线（定位/矩阵/排序）。高德瞬时故障只重跑本阶段 ----
     for attempt in (1, 2):
-        # 第 1 次用传入模型（通常是快速模型）；失手后重试换更稳的回退模型
-        use_llm = llm if attempt == 1 or fallback_llm is None else fallback_llm
         try:
-            route, retryable = await _plan(query, use_llm, notify)
+            route = await _plan_geo(query, extracted, notify)
         except Exception:
-            logger.exception("路线规划第 %d 次尝试异常", attempt)
-            route, retryable = None, True
+            logger.exception("地图管线第 %d 次异常", attempt)
+            route = None
         if route:
             if attempt > 1:
-                logger.info("路线规划重试成功")
-            return route, "ok"
-        if not retryable:
-            logger.info("路线规划不适用（单目的地等），交给常规流程")
-            return None, "not_applicable"
+                logger.info("地图管线重试成功")
+            result = (route, "ok")
+            _cache_put(_route_cache, query, result)
+            return result
         if attempt == 1:
-            logger.warning(
-                "路线规划第 1 次失败，%s重试",
-                "换回退模型" if fallback_llm is not None else "",
-            )
-    logger.error("路线规划两次尝试均失败，本次报告将退化为纯 LLM 排线")
+            logger.warning("地图管线第 1 次失败，重试一次（不重复抽取）")
+    logger.error("地图管线两次尝试均失败，本次报告将退化为纯 LLM 排线")
     return None, "failed"
 
 
@@ -167,25 +218,14 @@ async def plan_route_skeleton(query: str, llm) -> str:
     return route["markdown"] if route else ""
 
 
-async def _plan(query: str, llm, notify=lambda msg: None) -> tuple[Optional[dict], bool]:
-    """返回 (route, retryable)。route 为 None 时 retryable 区分
-    「值得重试的失败」（抽取输出不合法、高德瞬时故障）与「确实不适用」。"""
-    key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
+async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Optional[dict]:
+    """地图管线：定位途经点 → 驾车距离矩阵 → 最短环线 → 骨架 Markdown。
 
-    notify("正在从需求中抽取出发地与途经点...")
-    extracted = await _extract_stops(query, llm)
-    if not extracted:
-        logger.warning("途经点抽取未返回合法 JSON")
-        return None, True
+    抽取结果由调用方传入（plan_route 阶段一），本函数只负责地图部分，
+    失败返回 None——高德瞬时故障重试时不需要重复抽取。"""
+    key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
     origin = (extracted.get("origin") or "").strip()
     stops = [s.strip() for s in extracted.get("stops") or [] if s and s.strip()]
-    if len(stops) < 2:
-        # 单目的地不存在排序问题，交给既有的高德参考数据即可
-        return None, False
-    if not origin:
-        # 多途经点却没识别出出发地，多半是抽取偶发漏抽，值得重试
-        logger.warning("多途经点但未识别出出发地: %r", extracted)
-        return None, True
     user_fixed_order = bool(extracted.get("user_fixed_order"))
     origin_inferred = bool(extracted.get("origin_inferred"))
     round_trip = extracted.get("round_trip", True) is not False
@@ -203,7 +243,7 @@ async def _plan(query: str, llm, notify=lambda msg: None) -> tuple[Optional[dict
         if located[0] is None:
             # 出发地都定位不到，骨架无从谈起（多为高德瞬时故障，值得重试）
             logger.warning("出发地定位失败: %s", origin)
-            return None, True
+            return None
 
         located_names, located_coords, poi_names, failed = [], [], [], []
         for name, item in zip(names, located):
@@ -216,7 +256,7 @@ async def _plan(query: str, llm, notify=lambda msg: None) -> tuple[Optional[dict
         # 除出发地外至少要有 2 个可定位途经点才有排序价值
         if len(located_coords) < 3:
             logger.warning("可定位途经点不足: 成功 %s / 失败 %s", located_names, failed)
-            return None, True
+            return None
 
         # 高德 POI 名里的状态标注（如「坐龙峡风景区(暂停开放)」）提出来，
         # 让攻略主动提醒核实，而不是当它不存在
@@ -270,7 +310,7 @@ async def _plan(query: str, llm, notify=lambda msg: None) -> tuple[Optional[dict
         "origin_inferred": origin_inferred,
         "origin": origin,
         "markdown": markdown,
-    }, True
+    }
 
 
 async def _extract_stops(query: str, llm) -> Optional[dict]:
@@ -610,6 +650,12 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         round_trip = route.get("round_trip", True)
     except (KeyError, TypeError):
         return None
+    # 缓存键绑定 query + 骨架内容：路线缓存过期重算后骨架若有变化，
+    # 旧日程缓存自动失效，不会出现路线与日程不配套
+    cache_key = query + "\n" + route.get("markdown", "")
+    cached = _cache_get(_dayplan_cache, cache_key)
+    if cached is not None:
+        return cached
     if not legs:
         return None
     days_budget = route.get("days_budget")
@@ -669,11 +715,13 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
 
     if budget_note:
         notes.append(budget_note)
-    return {
+    result = {
         "overview": " → ".join(seq_names),
         "scaffold_md": _render_scaffold(days, route.get("alerts") or [], "\n　⚠️ ".join(notes)),
         "days": days,
     }
+    _cache_put(_dayplan_cache, cache_key, result)
+    return result
 
 
 async def _allocate_stay_days(query: str, stop_names: list[str], llm) -> list[int]:
