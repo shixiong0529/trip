@@ -86,6 +86,36 @@ _BRUTE_FORCE_LIMIT = 8
 _LONG_LEG_KM = 500
 _LONG_LEG_HOURS = 6
 
+# 相邻途经点驾车距离低于此值即合并为一站（同一片区顺访，不设独立转移日）
+_MIN_LEG_KM = 15
+
+
+def _collapse_near_stops(
+    seq: list[int],
+    names: list[str],
+    dist_km: list[list[float]],
+) -> tuple[list[int], dict[int, str]]:
+    """把序列中相距 <_MIN_LEG_KM 的相邻途经点合并为一站。
+
+    返回 (新序列, 各保留索引的展示名)。被并入的点名字拼进保留点
+    （去掉重复的县市前缀），出发地（索引 0）永不参与合并。
+    """
+    merged_names = {i: names[i] for i in set(seq)}
+    collapsed = [seq[0]]
+    for idx in seq[1:]:
+        prev = collapsed[-1]
+        if idx != 0 and prev != 0 and dist_km[prev][idx] < _MIN_LEG_KM:
+            extra = names[idx]
+            # 共享县/市前缀时只留景点名，如 "溆浦县山背梯田·花瑶古寨"
+            for cut in range(min(len(extra), len(names[prev])), 1, -1):
+                if extra[:cut] and names[prev].startswith(extra[:cut]):
+                    extra = extra[cut:] or extra
+                    break
+            merged_names[prev] = f"{merged_names[prev]}·{extra}"
+            continue
+        collapsed.append(idx)
+    return collapsed, merged_names
+
 # 高德 POI 名称里的状态标注，如「坐龙峡风景区(暂停开放)」
 _POI_STATUS_RE = re.compile(r"[（(]([^（）()]*(?:暂停|关闭|停业|歇业|闭园|维护|装修)[^（）()]*)[)）]")
 
@@ -274,11 +304,15 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
             order = _best_order(dist_km, round_trip)
 
         seq = [0] + order + ([0] if round_trip else [])
-        seq_names = [located_names[i] for i in seq]
+        # 相邻途经点近到没有独立转移意义时（如"山背梯田"与紧邻的"花瑶古寨"
+        # 实测 <15km）合并为一站顺访，否则骨架会排出"0km 转移日"，
+        # 模型没法为它生成正常的一天，版式必乱
+        seq, merged_names = _collapse_near_stops(seq, located_names, dist_km)
+        seq_names = [merged_names[i] for i in seq]
         legs = [
             {
-                "from": located_names[a],
-                "to": located_names[b],
+                "from": merged_names[a],
+                "to": merged_names[b],
                 "km": dist_km[a][b],
                 "hours": dur_h[a][b],
                 "measured": measured[a][b],
@@ -844,6 +878,13 @@ def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
         ok, reason = _match_day(text, day)
         if not ok:
             return False, reason
+    # 每个 Day 小节必须有自己的正文表格——两个标题连排共用正文属于版式违规
+    bodies = _DAY_HEADER_RE.split(markdown)[3:]  # split 产出 [前言, num, text, body, num, text, body...]
+    for i in range(0, len(bodies), 3):
+        body = bodies[i]
+        day_num = expected[i // 3]["day"] if i // 3 < len(expected) else "?"
+        if "|" not in body:
+            return False, f"Day {day_num} 小节没有自己的时段表格（疑似多天共用正文）"
     return True, ""
 
 
@@ -858,13 +899,20 @@ def check_day_sequence_prefix(markdown: str, day_plan: dict) -> tuple[bool, str]
     cut = markdown.rfind("\n")
     if cut < 0:
         return True, ""
-    headers = _DAY_HEADER_RE.findall(markdown[:cut + 1])
+    complete = markdown[:cut + 1]
+    headers = _DAY_HEADER_RE.findall(complete)
     if len(headers) > len(expected):
         return False, f"Day 数量超出骨架（应为 {len(expected)} 天）"
     for (_num, text), day in zip(headers, expected):
         ok, reason = _match_day(text, day)
         if not ok:
             return False, reason
+    # 已被下一天标题封口的小节必须有自己的表格；最后一节仍在生成中，不校验
+    parts = _DAY_HEADER_RE.split(complete)[3:]
+    for k in range(len(headers) - 1):
+        if "|" not in parts[3 * k]:
+            day_num = expected[k]["day"] if k < len(expected) else "?"
+            return False, f"Day {day_num} 小节没有自己的时段表格（疑似多天共用正文）"
     return True, ""
 
 
@@ -891,7 +939,10 @@ def _render_scaffold(
         "禁止增加或删除任何一天，禁止反向。" + dir_lock +
         "请为每一天输出形如 "
         "`### Day N · <你起的主题> · <下面锁定的城市与里程原样照抄>` 的小节标题。"
-        "「↳」开头的行是对该天正文内容的附加要求，不要出现在标题里。",
+        "「↳」开头的行是对该天正文内容的附加要求，不要出现在标题里。"
+        "每一天必须独立成节：一个 `### Day N` 标题后紧跟当天完整的时段表格、"
+        "本日亮点、本日预算，然后才能出现下一天的标题；"
+        "禁止两个 Day 标题连排共用正文，禁止用加粗小标题代替 `### Day N`。",
         "",
     ]
     if budget_note:
