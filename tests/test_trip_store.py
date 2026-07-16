@@ -138,6 +138,26 @@ def test_clean_expired_wendao_cache(isolated_db):
     assert trip_store.get_cached_wendao("fresh-hash") is not None
 
 
+def test_planning_cache_survives_memory_cache_and_expires(isolated_db):
+    trip_store = isolated_db
+    trip_store.save_planning_cache("route:key", "route", "normalized", '{"status":"ok"}')
+
+    cached = trip_store.get_planning_cache("route:key")
+    assert cached is not None
+    assert cached["kind"] == "route"
+
+    conn = trip_store._get_db()
+    conn.execute(
+        "UPDATE planning_cache SET created_at = ? WHERE cache_key = ?",
+        (time.time() - 8000, "route:key"),
+    )
+    conn.commit()
+    conn.close()
+
+    trip_store.clean_expired_planning_cache(7200)
+    assert trip_store.get_planning_cache("route:key") is None
+
+
 # ---------- 行程字段解析 ----------
 
 @pytest.mark.parametrize(

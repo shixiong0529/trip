@@ -105,6 +105,29 @@ def test_concurrent_generations_are_limited_and_isolated(monkeypatch, isolated_d
     )
 
 
+def test_unexpected_html_failure_does_not_leak_internal_details(monkeypatch):
+    class FakeOrchestrator:
+        def __init__(self, **kwargs):
+            pass
+
+        async def generate(self, query: str):
+            yield {"type": "content", "data": "# 测试报告"}
+
+    monkeypatch.setattr("orchestrator.TravelGuideOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "generator.TravelGuideGenerator.to_html",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("/private/database/path secret-upstream-body")
+        ),
+    )
+
+    stream = asyncio.run(_consume_generation("触发 HTML 错误"))
+
+    assert "event: error\ndata: 报告生成失败，请稍后重试" in stream
+    assert "secret-upstream-body" not in stream
+    assert "/private/database/path" not in stream
+
+
 async def _run_all(queries: list[str]) -> list[str]:
     tasks = []
     for index, query in enumerate(queries):

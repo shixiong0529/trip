@@ -7,6 +7,7 @@ FastAPI 应用主入口
 
 import uuid
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -22,6 +23,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import llm_config, app_config
+
+logger = logging.getLogger(__name__)
 
 # ---------- 创建应用 ----------
 app = FastAPI(
@@ -76,6 +79,7 @@ def _clean_cache_sync():
     from services import trip_store
     trip_store.clean_expired_guides(app_config.guide_cache_ttl)
     trip_store.clean_expired_wendao_cache(app_config.wendao_cache_ttl)
+    trip_store.clean_expired_planning_cache(app_config.route_plan_cache_ttl)
 
 
 async def _clean_cache():
@@ -94,6 +98,7 @@ async def health_check():
         "status": "ok",
         "llm_configured": llm_config.is_configured,
         "model": llm_config.model,
+        "fast_model": llm_config.fast_model,
         "ctrip_ready": ctrip_ready,
         "pdf_ready": _weasyprint_available,
         "fliggy_ready": fliggy_flight.is_configured(),
@@ -191,8 +196,10 @@ async def generate_guide(request: Request):
                 yield f"event: result\ndata: {result_data}\n\n"
                 yield "event: done\ndata: {}\n\n"
 
-        except Exception as e:
-            yield f"event: error\ndata: {_sse_line(e)}\n\n"
+        except Exception:
+            logger.exception("生成报告或保存 HTML 失败")
+            # 详细异常可能包含数据库路径、上游响应等内部信息，只写服务端日志。
+            yield "event: error\ndata: 报告生成失败，请稍后重试\n\n"
 
     return StreamingResponse(
         event_stream(),

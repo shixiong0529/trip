@@ -596,7 +596,7 @@ def _parse_table(lines: list[str]) -> list[list[str]]:
         # 跳过分隔行 |---|
         if re.match(r"^\|[\s\-:|]+\|$", line.strip()):
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        cells = _split_markdown_table_row(line)
         rows.append(cells)
     if rows:
         width = max(len(row) for row in rows)
@@ -605,6 +605,37 @@ def _parse_table(lines: list[str]) -> list[list[str]]:
         for row in rows:
             row.extend([""] * (width - len(row)))
     return rows
+
+
+def _split_markdown_table_row(line: str) -> list[str]:
+    r"""按 Markdown 规则拆表格行，不把 ``\|`` 或行内代码里的 ``|`` 当分隔符。"""
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|") and not text.endswith(r"\|"):
+        text = text[:-1]
+
+    cells: list[str] = []
+    current: list[str] = []
+    in_code = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char == "\\" and index + 1 < len(text) and text[index + 1] == "|":
+            current.append("|")
+            index += 2
+            continue
+        if char == "`":
+            in_code = not in_code
+            current.append(char)
+        elif char == "|" and not in_code:
+            cells.append("".join(current).strip())
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    cells.append("".join(current).strip())
+    return cells
 
 
 # ---------- HTML 生成 ----------
@@ -655,7 +686,7 @@ def _blocks_to_html_fragment(blocks: list[dict]) -> str:
             in_section = True
 
         # H3 "Day X" → 日程卡片
-        elif t == "h3" and ("Day" in content or content.startswith("Day ") or "day" in content.lower()):
+        elif t == "h3" and re.match(r"^Day\s+\d+\b", content.strip(), re.IGNORECASE):
             day_html, new_i = _render_day_card(blocks, i)
             html += day_html
             i = new_i
@@ -1002,6 +1033,11 @@ class TravelGuideGenerator:
         """Markdown → 完整 HTML 页面"""
         markdown_content = normalize_report_markdown(markdown_content)
         blocks = _parse_markdown_to_blocks(markdown_content)
+
+        # 模型偶尔会漏掉一级标题。没有 H1 时原实现不会打开 .container，
+        # 报告会贴边铺满页面；补一个稳定标题，保证完整 HTML 结构。
+        if not any(block["type"] == "h1" for block in blocks):
+            blocks.insert(0, {"type": "h1", "content": "旅行攻略"})
         body_html = _blocks_to_html_fragment(blocks)
 
         # 尝试从 h1 提取标题
@@ -1163,7 +1199,7 @@ class TravelGuideGenerator:
 <div class="guide-container">
 {body_html}
 <p style="text-align:center;color:#94a3b8;font-size:0.78em;margin-top:40px;border-top:1px solid #e2e8f0;padding-top:20px;">
-  AI 旅行攻略生成器 · 攻略编号 {guide_id} · 价格信息仅供参考
+  AI 旅行攻略生成器 · 攻略编号 {_escape_html(guide_id)} · 价格信息仅供参考
 </p>
 </div>
 </body>

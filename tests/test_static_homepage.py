@@ -1,8 +1,24 @@
 from pathlib import Path
 import re
 
+from fastapi.testclient import TestClient
+
+from app import app
+
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_homepage_get_and_head_return_ok():
+    client = TestClient(app)
+
+    get_response = client.get("/")
+    head_response = client.head("/")
+
+    assert get_response.status_code == 200
+    assert head_response.status_code == 200
+    assert head_response.text == ""
+    assert head_response.headers["content-type"].startswith("text/html")
 
 
 def test_homepage_uses_clear_background_and_note_footer():
@@ -57,6 +73,15 @@ def test_generation_frontend_isolates_cancelled_requests():
     assert "if (state.mode === 'generating') return" in app_js
     assert "const body = { query: query }" in app_js
     assert "state.config" not in app_js
+
+
+def test_generation_tab_switch_preserves_the_real_generation_mode():
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "activeTab: 'generate'" in app_js
+    assert "function setActiveTab(tabName)" in app_js
+    assert "setMode(state.mode);" in app_js
+    assert "setActiveTab('generate');" in app_js
 
 
 def test_homepage_uses_logo_image_as_nav_icon_only():

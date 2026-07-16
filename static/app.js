@@ -45,6 +45,7 @@
     progressSteps: [],
     abortController: null,
     generationRunId: 0,
+    activeTab: 'generate', // generate | trips；切换页面时保留真实生成状态
     pdfReady: true,      // 由 /api/health 的 pdf_ready 更新，决定 PDF 下载按钮是否可用
   };
 
@@ -97,12 +98,30 @@
   // ====== 模式切换 ======
   function setMode(mode) {
     state.mode = mode;
+    if (state.activeTab === 'trips') {
+      els.inputSection.style.display = 'none';
+      els.generatingSection.style.display = 'none';
+      els.resultSection.style.display = 'none';
+      els.tripsSection.style.display = 'block';
+      return;
+    }
     els.inputSection.style.display = mode === 'idle' ? 'flex' : 'none';
     els.generatingSection.style.display = mode === 'generating' ? 'block' : 'none';
     els.resultSection.style.display = mode === 'done' ? 'block' : 'none';
     els.tripsSection.style.display = 'none';
     if (mode === 'done') {
       updatePdfButtonState();
+    }
+  }
+
+  function setActiveTab(tabName) {
+    state.activeTab = tabName;
+    els.navTabs.forEach(function(tab) {
+      tab.classList.toggle('active', tab.dataset.tab === tabName);
+    });
+    setMode(state.mode);
+    if (tabName === 'trips') {
+      loadTrips();
     }
   }
 
@@ -269,6 +288,9 @@
   }
 
   function renderGuide() {
+    // 即使用户生成期间查看了“我的行程”，完成后也应回到报告结果，
+    // 同时让导航高亮与实际内容保持一致。
+    setActiveTab('generate');
     setMode('done');
     els.guideIdLabel.textContent = '编号: ' + state.guideId;
 
@@ -373,16 +395,7 @@
   // ====== Tab 切换 ======
   els.navTabs.forEach(function(tab) {
     tab.addEventListener('click', function() {
-      els.navTabs.forEach(function(t) { t.classList.remove('active'); });
-      tab.classList.add('active');
-      var tabName = tab.dataset.tab;
-      els.inputSection.style.display = tabName === 'generate' ? 'flex' : 'none';
-      els.generatingSection.style.display = 'none';
-      els.resultSection.style.display = 'none';
-      els.tripsSection.style.display = tabName === 'trips' ? 'block' : 'none';
-      if (tabName === 'trips') {
-        loadTrips();
-      }
+      setActiveTab(tab.dataset.tab);
     });
   });
 

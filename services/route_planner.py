@@ -13,6 +13,7 @@
 """
 
 import asyncio
+import hashlib
 import itertools
 import json
 import logging
@@ -20,6 +21,7 @@ import math
 import os
 import re
 import time
+import unicodedata
 from typing import Any, Optional
 
 logger = logging.getLogger("route_planner")
@@ -39,7 +41,7 @@ _amap_lock = asyncio.Lock()
 
 # 规划结果缓存：同一需求短时间内重复生成（用户重试/微调很常见）时
 # 直接复用路线骨架与日程脚手架，Phase 1 的规划耗时归零
-_PLAN_CACHE_TTL = 7200
+_PLAN_CACHE_TTL = int(os.getenv("ROUTE_PLAN_CACHE_TTL", "7200"))
 _PLAN_CACHE_MAX = 32
 _route_cache: dict[str, tuple[float, Any]] = {}
 _dayplan_cache: dict[str, tuple[float, Any]] = {}
@@ -61,6 +63,45 @@ def _cache_put(cache: dict, key: str, value) -> None:
         oldest = min(cache, key=lambda k: cache[k][0])
         cache.pop(oldest, None)
     cache[key] = (time.time(), value)
+
+
+def _normalize_query_for_cache(query: str) -> str:
+    """规范化不改变语义的空白和常见标点，让轻微改写仍可复用规划。"""
+    text = unicodedata.normalize("NFKC", query or "").strip().lower()
+    return re.sub(r"[\s，,。！？!?；;]+", "", text)
+
+
+def _persistent_cache_key(kind: str, material: str) -> str:
+    digest = hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return f"{kind}:{digest}"
+
+
+async def _load_persistent_cache(kind: str, material: str):
+    try:
+        from services import trip_store
+        key = _persistent_cache_key(kind, material)
+        row = await asyncio.to_thread(trip_store.get_planning_cache, key)
+        if not row or time.time() - row["created_at"] > _PLAN_CACHE_TTL:
+            return None
+        return json.loads(row["result"])
+    except Exception:
+        logger.debug("读取规划持久化缓存失败", exc_info=True)
+        return None
+
+
+async def _save_persistent_cache(kind: str, material: str, value) -> None:
+    try:
+        from services import trip_store
+        key = _persistent_cache_key(kind, material)
+        await asyncio.to_thread(
+            trip_store.save_planning_cache,
+            key,
+            kind,
+            material,
+            json.dumps(value, ensure_ascii=False),
+        )
+    except Exception:
+        logger.debug("写入规划持久化缓存失败", exc_info=True)
 
 
 async def _amap_paced(call):
@@ -194,19 +235,26 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
         return None, "not_applicable"
     notify = _make_notify(on_progress)
 
-    cached = _cache_get(_route_cache, query)
+    normalized_query = _normalize_query_for_cache(query)
+    cached = _cache_get(_route_cache, normalized_query)
     if cached is not None:
         notify("同一需求近期已规划过，直接复用路线骨架...")
         return cached
+    persistent = await _load_persistent_cache("route", normalized_query)
+    if isinstance(persistent, dict) and "status" in persistent:
+        result = (persistent.get("route"), persistent["status"])
+        _cache_put(_route_cache, normalized_query, result)
+        notify("已从持久化缓存复用路线骨架...")
+        return result
 
     # ---- 阶段一：途经点抽取。快速模型失手只重抽这一步（换回退模型），
     # 不再把已成功的地图管线整个重跑 ----
     notify("正在从需求中抽取出发地与途经点...")
-    extracted = await _extract_stops(query, llm)
+    extracted = await _extract_stops(query, llm, _FAST_EXTRACT_TIMEOUT)
     if extracted is None and fallback_llm is not None:
         logger.warning("快速模型抽取失败，换回退模型重抽")
         notify("途经点抽取失败，正在换主模型重试...")
-        extracted = await _extract_stops(query, fallback_llm)
+        extracted = await _extract_stops(query, fallback_llm, _FALLBACK_EXTRACT_TIMEOUT)
     if extracted is None:
         logger.error("途经点抽取两次均失败，本次报告将退化为纯 LLM 排线")
         return None, "failed"
@@ -217,7 +265,10 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
         # 单目的地不存在排序问题，交给既有的高德参考数据即可
         logger.info("路线规划不适用（单目的地），交给常规流程")
         result = (None, "not_applicable")
-        _cache_put(_route_cache, query, result)
+        _cache_put(_route_cache, normalized_query, result)
+        await _save_persistent_cache(
+            "route", normalized_query, {"route": None, "status": "not_applicable"}
+        )
         return result
     if not origin:
         logger.warning("多途经点但未识别出出发地（含推断）: %r", extracted)
@@ -234,7 +285,10 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
             if attempt > 1:
                 logger.info("地图管线重试成功")
             result = (route, "ok")
-            _cache_put(_route_cache, query, result)
+            _cache_put(_route_cache, normalized_query, result)
+            await _save_persistent_cache(
+                "route", normalized_query, {"route": route, "status": "ok"}
+            )
             return result
         if attempt == 1:
             logger.warning("地图管线第 1 次失败，重试一次（不重复抽取）")
@@ -347,17 +401,29 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
     }
 
 
-# LLM 小任务的时限：正常几秒返回；API 拥堵时（httpx 层超时长达 120s）
-# 不能让一次抽取把整个规划挂住——超时按失败处理，走既有回退链
-_EXTRACT_TIMEOUT = 30.0
+# LLM 小任务的时限：快速模型应在短时限内完成；主模型回退本身较慢，
+# 需要独立的较长时限，不能沿用快速模型的 30 秒而被提前误杀。
+_FAST_EXTRACT_TIMEOUT = 25.0
+_FALLBACK_EXTRACT_TIMEOUT = 55.0
 _STAY_ALLOC_TIMEOUT = 25.0
 
 
-async def _extract_stops(query: str, llm) -> Optional[dict]:
+async def _extract_stops(query: str, llm, timeout_seconds: float) -> Optional[dict]:
     try:
-        return await asyncio.wait_for(_extract_stops_inner(query, llm), _EXTRACT_TIMEOUT)
+        return await asyncio.wait_for(_extract_stops_inner(query, llm), timeout_seconds)
     except asyncio.TimeoutError:
-        logger.warning("途经点抽取超时（%.0fs）", _EXTRACT_TIMEOUT)
+        logger.warning(
+            "途经点抽取超时（model=%s, %.0fs）",
+            getattr(llm, "model", "unknown"),
+            timeout_seconds,
+        )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "途经点抽取调用失败（model=%s）: %s",
+            getattr(llm, "model", "unknown"),
+            exc,
+        )
         return None
 
 
@@ -366,9 +432,13 @@ async def _extract_stops_inner(query: str, llm) -> Optional[dict]:
         {"role": "system", "content": _EXTRACT_SYSTEM},
         {"role": "user", "content": _EXTRACT_TEMPLATE.format(query=query)},
     ]
-    text = ""
-    async for chunk in llm.chat_stream(messages):
-        text += chunk
+    if callable(getattr(llm, "chat_json", None)):
+        text = await llm.chat_json(messages)
+    else:
+        # 测试替身及旧客户端兼容路径。
+        text = ""
+        async for chunk in llm.chat_stream(messages):
+            text += chunk
     start, end = text.find("{"), text.rfind("}")
     if start < 0 or end <= start:
         logger.warning("抽取输出中没有 JSON 对象，原文: %r", text[:300])
@@ -700,10 +770,14 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         return None
     # 缓存键绑定 query + 骨架内容：路线缓存过期重算后骨架若有变化，
     # 旧日程缓存自动失效，不会出现路线与日程不配套
-    cache_key = query + "\n" + route.get("markdown", "")
+    cache_key = _normalize_query_for_cache(query) + "\n" + route.get("markdown", "")
     cached = _cache_get(_dayplan_cache, cache_key)
     if cached is not None:
         return cached
+    persistent = await _load_persistent_cache("dayplan", cache_key)
+    if isinstance(persistent, dict) and isinstance(persistent.get("days"), list):
+        _cache_put(_dayplan_cache, cache_key, persistent)
+        return persistent
     if not legs:
         return None
     days_budget = route.get("days_budget")
@@ -769,6 +843,7 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         "days": days,
     }
     _cache_put(_dayplan_cache, cache_key, result)
+    await _save_persistent_cache("dayplan", cache_key, result)
     return result
 
 
@@ -844,28 +919,96 @@ def _cities_match(a: str, b: str) -> bool:
     return bool(a) and bool(b) and (a in b or b in a)
 
 
+def _compact_place_text(text: str) -> str:
+    """压平标题中的展示符号与游览说明，保留可用于地名比对的文字。"""
+    text = re.sub(r"(?:深度游|休整|当地游览|无城际转移)", "", text or "")
+    text = re.sub(r"约?\s*\d+(?:\.\d+)?\s*(?:km|公里|h|小时)", "", text, flags=re.I)
+    return re.sub(r"[\s·/（）()，,。:：;；\-—]+", "", text)
+
+
+def _place_matches(actual: str, expected: str) -> bool:
+    """宽松比对景点名，兼容合并站点和模型省略县市前缀的写法。"""
+    actual_compact = _compact_place_text(actual)
+    if not actual_compact:
+        return False
+
+    # 合并站点如“溆浦县山背梯田·花瑶古寨”必须两个景点都出现；不能像
+    # 旧实现那样先按“·”截断标题，再拿半个名称与完整站点比较。
+    for component in re.split(r"[·/]", expected or ""):
+        compact = _compact_place_text(component)
+        if not compact:
+            continue
+        aliases = [compact]
+        admin = re.match(r"^.{2,8}?[市县区镇乡](.{2,})$", compact)
+        if admin:
+            aliases.append(admin.group(1))
+        if not any(alias in actual_compact for alias in aliases):
+            return False
+    return True
+
+
 def _match_day(text: str, day: dict) -> tuple[bool, str]:
     """比对一条 Day 标题与骨架中的对应天。只看城市转移/停留，不纠结主题名。"""
-    # 取标题中含「→」或「深度游/休整」的那一段做地名比对
-    seg = next(
-        (p for p in text.split("·") if "→" in p or "深度游" in p or "休整" in p),
-        text,
-    )
     if day["kind"] == "transfer":
-        if "→" not in seg:
+        if "→" not in text:
             return False, f"Day {day['day']} 应为转移日 {day['from']}→{day['to']}，标题却无转移"
-        # 串点日标题形如 A → B → C，只校验首尾端点
-        hops = [s.split("·")[0].strip() for s in seg.split("→")]
+        # 不按「·」切标题：合并站点本身也包含该符号（例如
+        # “山背梯田·花瑶”）。旧逻辑会把 canonical 标题再次截成
+        # “山背梯田”，导致确定性修正后仍永远校验失败。
+        # 标题主题和里程留在首尾文本里无妨，_place_matches 只检查
+        # 期望地名是否完整出现。
+        hops = [s.strip() for s in text.split("→")]
         left, right = hops[0], hops[-1]
-        if not (_cities_match(left, day["from"]) and _cities_match(right, day["to"])):
+        if not (_place_matches(left, day["from"]) and _place_matches(right, day["to"])):
             return False, (
                 f"Day {day['day']} 城市不符：应为 {day['from']}→{day['to']}，"
                 f"实际 {left}→{right}"
             )
     else:  # stay
-        if not _cities_match(seg, day["at"]):
+        # 停留站可能是“景点A·景点B”的合并站，须用完整标题比对。
+        if not _place_matches(text, day["at"]):
             return False, f"Day {day['day']} 应为 {day['at']} 停留日，标题不符"
     return True, ""
+
+
+def _display_number(value: Any) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value or 0)
+    return str(int(number)) if number.is_integer() else f"{number:.1f}".rstrip("0").rstrip(".")
+
+
+def repair_day_headings(markdown: str, day_plan: dict) -> tuple[str, int]:
+    """按锁定骨架确定性修正 Day 标题，不为标题文案偏差重写整篇报告。"""
+    expected = day_plan.get("days") or []
+    matches = list(_DAY_HEADER_RE.finditer(markdown))
+    if len(matches) != len(expected):
+        return markdown, 0
+
+    replacements: list[tuple[int, int, str]] = []
+    for match, day in zip(matches, expected):
+        number, text = match.groups()
+        ok, _ = _match_day(text, day)
+        if ok and int(number) == int(day["day"]):
+            continue
+
+        theme = text.split("·", 1)[0].strip() or "当日行程"
+        if day["kind"] == "transfer":
+            route = " → ".join([day["from"], *(day.get("via") or []), day["to"]])
+            suffix = f"{route} · {_display_number(day.get('km'))}km"
+            if day.get("hours") is not None:
+                suffix += f" · 约{_display_number(day.get('hours'))}h"
+        else:
+            suffix = f"{day['at']} 深度游/休整 · 0km"
+        hashes = re.match(r"^(#{1,4})", match.group(0)).group(1)
+        replacements.append(
+            (match.start(), match.end(), f"{hashes} Day {day['day']} · {theme} · {suffix}")
+        )
+
+    for start, end, replacement in reversed(replacements):
+        markdown = markdown[:start] + replacement + markdown[end:]
+    return markdown, len(replacements)
 
 
 def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
@@ -874,7 +1017,9 @@ def validate_day_sequence(markdown: str, day_plan: dict) -> tuple[bool, str]:
     headers = _DAY_HEADER_RE.findall(markdown)
     if len(headers) != len(expected):
         return False, f"天数不符：应为 {len(expected)} 天，实际 {len(headers)} 天"
-    for (_num, text), day in zip(headers, expected):
+    for (num, text), day in zip(headers, expected):
+        if int(num) != int(day["day"]):
+            return False, f"Day 编号不符：应为 {day['day']}，实际 {num}"
         ok, reason = _match_day(text, day)
         if not ok:
             return False, reason
@@ -903,10 +1048,8 @@ def check_day_sequence_prefix(markdown: str, day_plan: dict) -> tuple[bool, str]
     headers = _DAY_HEADER_RE.findall(complete)
     if len(headers) > len(expected):
         return False, f"Day 数量超出骨架（应为 {len(expected)} 天）"
-    for (_num, text), day in zip(headers, expected):
-        ok, reason = _match_day(text, day)
-        if not ok:
-            return False, reason
+    # 标题编号、简称和路线文字可在成稿后按骨架确定性修正，不值得为此中断
+    # 已生成正文。增量阶段只拦截无法安全修补的结构问题。
     # 已被下一天标题封口的小节必须有自己的表格；最后一节仍在生成中，不校验
     parts = _DAY_HEADER_RE.split(complete)[3:]
     for k in range(len(headers) - 1):

@@ -105,6 +105,14 @@ def init_db():
             result TEXT DEFAULT '',
             created_at REAL DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS planning_cache (
+            cache_key TEXT PRIMARY KEY,
+            kind TEXT NOT NULL,
+            input TEXT DEFAULT '',
+            result TEXT DEFAULT '',
+            created_at REAL DEFAULT 0
+        );
     """)
     conn.commit()
 
@@ -330,6 +338,40 @@ def clean_expired_wendao_cache(ttl_seconds: int) -> None:
     conn = _get_db()
     conn.execute(
         "DELETE FROM wendao_cache WHERE (? - created_at) > ?",
+        (time.time(), ttl_seconds),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------- 路线规划持久化缓存 ----------
+
+def get_planning_cache(cache_key: str) -> Optional[dict]:
+    conn = _get_db()
+    row = conn.execute(
+        "SELECT * FROM planning_cache WHERE cache_key = ?", (cache_key,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_planning_cache(cache_key: str, kind: str, input_text: str, result: str) -> None:
+    now = time.time()
+    conn = _get_db()
+    conn.execute("""
+        INSERT INTO planning_cache (cache_key, kind, input, result, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(cache_key) DO UPDATE SET
+            kind = ?, input = ?, result = ?, created_at = ?
+    """, (cache_key, kind, input_text, result, now, kind, input_text, result, now))
+    conn.commit()
+    conn.close()
+
+
+def clean_expired_planning_cache(ttl_seconds: int) -> None:
+    conn = _get_db()
+    conn.execute(
+        "DELETE FROM planning_cache WHERE (? - created_at) > ?",
         (time.time(), ttl_seconds),
     )
     conn.commit()

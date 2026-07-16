@@ -51,6 +51,33 @@ def test_script_tag_is_escaped():
     assert "&lt;script&gt;" in html
 
 
+def test_table_keeps_escaped_and_inline_code_pipes_in_one_cell():
+    md = (
+        "| 项目 | 说明 |\n"
+        "|---|---|\n"
+        r"| 交通 | 高铁\|地铁，命令 `a|b` |" "\n"
+    )
+
+    blocks = _parse_markdown_to_blocks(md)
+
+    assert blocks[0]["rows"] == [
+        ["项目", "说明"],
+        ["交通", "高铁|地铁，命令 `a|b`"],
+    ]
+    html = _blocks_to_html_fragment(blocks)
+    assert html.count("<td") == 2
+    assert "高铁|地铁，命令 <code>a|b</code>" in html
+
+
+def test_non_day_heading_containing_day_is_not_rendered_as_day_card():
+    blocks = _parse_markdown_to_blocks("### Daylight 出行说明\n普通内容\n")
+
+    html = _blocks_to_html_fragment(blocks)
+
+    assert '<h3 class="sub-title">Daylight 出行说明</h3>' in html
+    assert 'class="day-card"' not in html
+
+
 def test_uneven_table_to_docx_does_not_crash(gen):
     md = (
         "# 🗺️ 测试行程\n\n"
@@ -405,6 +432,15 @@ def test_to_html_has_hero_and_balanced_divs(gen):
     html = gen.to_html(md, "t3")
     assert '<div class="hero">' in html
     assert '<div class="container">' in html
+    assert html.count("<div") == html.count("</div")
+
+
+def test_to_html_adds_stable_container_when_model_omits_h1(gen):
+    html = gen.to_html("## 天气与穿搭\n晴朗\n", "missing-h1")
+
+    assert "<title>旅行攻略</title>" in html
+    assert '<div class="container">' in html
+    assert "<h1>旅行攻略</h1>" in html
     assert html.count("<div") == html.count("</div")
 
 

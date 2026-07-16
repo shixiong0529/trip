@@ -34,6 +34,7 @@ def test_health_check():
     data = resp.json()
     assert "status" in data
     assert "llm_configured" in data
+    assert "fast_model" in data
     assert "pdf_ready" in data
 
 
