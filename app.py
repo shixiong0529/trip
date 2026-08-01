@@ -8,6 +8,8 @@ FastAPI 应用主入口
 import uuid
 import asyncio
 import logging
+import re
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -25,6 +27,32 @@ from fastapi.middleware.cors import CORSMiddleware
 from config import llm_config, app_config
 
 logger = logging.getLogger(__name__)
+
+_REPORT_DURATION_TOKEN = "X9TRIPREPORTDURATION7Q"
+
+
+def _format_report_duration(elapsed_seconds: float) -> str:
+    """将报告生成耗时格式化为稳定的“几分几秒”文案。"""
+    total_seconds = int(max(0.0, elapsed_seconds) + 0.5)
+    minutes, seconds = divmod(total_seconds, 60)
+    return f"本报告生成耗时{minutes}分{seconds}秒"
+
+
+def _append_report_duration_token(markdown: str) -> str:
+    """在免责声明前预留耗时行，待 HTML 渲染完成后再替换。"""
+    markdown = markdown.rstrip()
+    disclaimer = re.search(
+        r"^>\s*(?:⚠️?\s*)?(?:\*\*)?(?:免责声明|免责申明)",
+        markdown,
+        re.MULTILINE,
+    )
+    duration_line = f"> {_REPORT_DURATION_TOKEN}"
+    if not disclaimer:
+        return f"{markdown}\n\n{duration_line}\n"
+
+    before = markdown[:disclaimer.start()].rstrip()
+    after = markdown[disclaimer.start():].lstrip()
+    return f"{before}\n\n{duration_line}\n\n{after}\n"
 
 # ---------- 创建应用 ----------
 app = FastAPI(
@@ -115,6 +143,8 @@ async def health_check():
 async def generate_guide(request: Request):
     from orchestrator import TravelGuideOrchestrator, LLMClientError
 
+    request_started_at = time.monotonic()
+
     try:
         body = await request.json()
     except Exception:
@@ -131,6 +161,13 @@ async def generate_guide(request: Request):
     if len(query) > 2000:
         raise HTTPException(status_code=400, detail="旅行需求不能超过 2000 字")
 
+    raw_mode = body.get("mode", "standard")
+    if not isinstance(raw_mode, str):
+        raise HTTPException(status_code=400, detail="生成模式必须是文本")
+    mode = raw_mode.strip().lower()
+    if mode not in {"standard", "professional"}:
+        raise HTTPException(status_code=400, detail="生成模式仅支持 standard 或 professional")
+
     try:
         # 模型地址和密钥只能来自服务器环境变量。绝不接受公网请求覆盖，
         # 否则攻击者可把服务端 API Key 转发到其控制的地址。
@@ -138,6 +175,7 @@ async def generate_guide(request: Request):
             base_url=llm_config.base_url,
             api_key=llm_config.api_key,
             model=llm_config.model,
+            mode=mode,
         )
     except LLMClientError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -181,10 +219,23 @@ async def generate_guide(request: Request):
                 guid = uuid.uuid4().hex
                 from generator import TravelGuideGenerator, normalize_report_markdown
                 full_markdown = normalize_report_markdown(full_markdown)
+                full_markdown = _append_report_duration_token(full_markdown)
                 gen = TravelGuideGenerator(app_config.templates_dir)
                 html_content = await asyncio.to_thread(gen.to_html, full_markdown, guid)
 
                 await _clean_cache()
+                elapsed_seconds = time.monotonic() - request_started_at
+                duration_text = _format_report_duration(elapsed_seconds)
+                full_markdown = full_markdown.replace(
+                    _REPORT_DURATION_TOKEN, duration_text
+                )
+                html_content = html_content.replace(_REPORT_DURATION_TOKEN, duration_text)
+                logger.info(
+                    "报告生成完成 mode=%s elapsed=%.2fs display=%s",
+                    mode,
+                    elapsed_seconds,
+                    duration_text,
+                )
                 from services import trip_store
                 await asyncio.to_thread(
                     trip_store.save_guide, guid, html_content, full_markdown
@@ -270,6 +321,16 @@ async def save_trip(request: Request):
     from services import trip_store
     body = await request.json()
     markdown = body.get("markdown", "")
+    guide_id = body.get("guide_id", "")
+    if guide_id is not None and not isinstance(guide_id, str):
+        raise HTTPException(status_code=400, detail="攻略编号必须是文本")
+    guide_id = (guide_id or "").strip()
+    if guide_id:
+        # 浏览器中的流式 Markdown 早于最终报告完成，可能缺少服务端追加的
+        # 耗时、预算修正等内容。保存行程时始终优先使用最终攻略正文。
+        guide = trip_store.get_guide(guide_id)
+        if guide and guide.get("markdown"):
+            markdown = guide["markdown"]
     from generator import normalize_report_markdown
     markdown = normalize_report_markdown(markdown)
     raw_destination = body.get("destination", "")

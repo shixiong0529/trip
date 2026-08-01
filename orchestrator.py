@@ -11,13 +11,19 @@ AI 编排层 v2.0
 import asyncio
 import json
 import logging
+import re
 import time
 import httpx
 from typing import AsyncGenerator
 
-from prompts import SYSTEM_PROMPT, build_user_message
+from prompts import (
+    build_user_message,
+    get_system_prompt,
+    normalize_generation_mode,
+    report_max_tokens,
+)
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error.orchestrator")
 
 
 class LLMClientError(Exception):
@@ -31,12 +37,15 @@ class LLMClient:
     def __init__(
         self, base_url: str, api_key: str, model: str,
         max_tokens: int = 16384, temperature: float = 0.7,
+        first_token_timeout: float = 45.0, stream_timeout: float = 75.0,
     ):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.model = model
         self.max_tokens = max_tokens
         self.temperature = temperature
+        self.first_token_timeout = max(0.01, first_token_timeout)
+        self.stream_timeout = max(self.first_token_timeout + 0.01, stream_timeout)
         self.last_finish_reason = None
 
     @property
@@ -60,56 +69,89 @@ class LLMClient:
         """
         self.last_finish_reason = None
         started = time.monotonic()
+        first_chunk_elapsed = None
         chunk_count = 0
         char_count = 0
         payload = self._build_payload(messages, stream=True)
+        # DeepSeek V4 默认可能启用思考模式并长时间只返回 reasoning_content，
+        # 甚至耗尽输出额度而没有最终正文。旅行报告只需要最终 Markdown。
+        payload["thinking"] = {"type": "disabled"}
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=self.stream_timeout + 5.0) as client:
             try:
-                async with client.stream(
-                    "POST", self.chat_url, json=payload, headers=headers
-                ) as response:
-                    if response.status_code == 401:
-                        raise LLMClientError("API Key 无效，请检查配置")
-                    elif response.status_code == 429:
-                        raise LLMClientError("API 调用频率过高，请稍后再试")
-                    elif response.status_code >= 400:
-                        body = await response.aread()
-                        raise LLMClientError(f"API 返回错误 (HTTP {response.status_code}): {body.decode()[:200]}")
+                async with asyncio.timeout(self.stream_timeout):
+                    async with client.stream(
+                        "POST", self.chat_url, json=payload, headers=headers
+                    ) as response:
+                        if response.status_code == 401:
+                            raise LLMClientError("API Key 无效，请检查配置")
+                        elif response.status_code == 429:
+                            raise LLMClientError("API 调用频率过高，请稍后再试")
+                        elif response.status_code >= 400:
+                            body = await response.aread()
+                            raise LLMClientError(f"API 返回错误 (HTTP {response.status_code}): {body.decode()[:200]}")
 
-                    async for line in response.aiter_lines():
-                        if line.startswith("data: "):
-                            data = line[6:].strip()
-                            if data == "[DONE]":
-                                break
+                        lines = response.aiter_lines().__aiter__()
+                        while True:
                             try:
-                                chunk = json.loads(data)
-                                choices = chunk.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        chunk_count += 1
-                                        char_count += len(content)
-                                        yield content
-                                    finish_reason = choices[0].get("finish_reason")
-                                    if finish_reason:
-                                        self.last_finish_reason = finish_reason
-                            except json.JSONDecodeError:
-                                continue
+                                if first_chunk_elapsed is None:
+                                    remaining = self.first_token_timeout - (
+                                        time.monotonic() - started
+                                    )
+                                    if remaining <= 0:
+                                        raise TimeoutError
+                                    async with asyncio.timeout(remaining):
+                                        line = await anext(lines)
+                                else:
+                                    line = await anext(lines)
+                            except StopAsyncIteration:
+                                break
+
+                            if line.startswith("data: "):
+                                data = line[6:].strip()
+                                if data == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                    choices = chunk.get("choices", [])
+                                    if choices:
+                                        delta = choices[0].get("delta", {})
+                                        content = delta.get("content", "")
+                                        if content:
+                                            if first_chunk_elapsed is None:
+                                                first_chunk_elapsed = time.monotonic() - started
+                                            chunk_count += 1
+                                            char_count += len(content)
+                                            yield content
+                                        finish_reason = choices[0].get("finish_reason")
+                                        if finish_reason:
+                                            self.last_finish_reason = finish_reason
+                                except json.JSONDecodeError:
+                                    continue
+            except TimeoutError:
+                self.last_finish_reason = "timeout"
+                phase = "首字" if first_chunk_elapsed is None else "总生成"
+                logger.warning(
+                    "LLM stream timeout model=%s phase=%s limit=%.1fs",
+                    self.model,
+                    phase,
+                    self.first_token_timeout if first_chunk_elapsed is None else self.stream_timeout,
+                )
+                return
             except httpx.ConnectError:
                 raise LLMClientError(f"无法连接到 {self.base_url}，请检查网络和 API 地址")
             except httpx.TimeoutException:
                 raise LLMClientError("API 请求超时，请重试")
             finally:
                 logger.info(
-                    "LLM stream model=%s elapsed=%.2fs chunks=%d chars=%d finish=%s",
+                    "LLM stream model=%s elapsed=%.2fs first_token=%s chunks=%d chars=%d finish=%s",
                     self.model,
                     time.monotonic() - started,
+                    f"{first_chunk_elapsed:.2f}s" if first_chunk_elapsed is not None else "none",
                     chunk_count,
                     char_count,
                     self.last_finish_reason,
@@ -193,16 +235,31 @@ class LLMClient:
 class TravelGuideOrchestrator:
     """旅游攻略编排器 v2.0 — 实时数据 + AI 生成"""
 
-    def __init__(self, base_url: str, api_key: str, model: str):
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        mode: str = "professional",
+    ):
         if not api_key:
             raise LLMClientError("未配置 API Key，请在 .env 文件中设置 LLM_API_KEY")
         # max_tokens 从配置读取（.env 的 LLM_MAX_TOKENS）：上限给足可避免长行程
         # 输出被 8192 截断而触发自动续写——续写会让总生成时间接近翻倍
         from config import llm_config
+        self.mode = normalize_generation_mode(mode)
+        if self.mode == "professional":
+            first_token_timeout = llm_config.professional_first_token_timeout
+            stream_timeout = llm_config.professional_stream_timeout
+        else:
+            first_token_timeout = llm_config.first_token_timeout
+            stream_timeout = llm_config.stream_timeout
         self.llm = LLMClient(
             base_url, api_key, model,
-            max_tokens=llm_config.max_tokens,
+            max_tokens=report_max_tokens(self.mode, llm_config.max_tokens),
             temperature=llm_config.temperature,
+            first_token_timeout=first_token_timeout,
+            stream_timeout=stream_timeout,
         )
         # 结构化小任务（途经点抽取、停留天分配）用快速模型，输出短、
         # 温度低；正文生成仍用主模型
@@ -224,29 +281,137 @@ class TravelGuideOrchestrator:
             f"{day_plan['scaffold_md']}"
         )
 
-    async def _stream_events(self, messages: list[dict], sink: dict):
-        """流式生成：content 事件边生成边外发，全文同步累积到 sink["content"]。
-
-        输出被截断（finish_reason == "length"）时自动续写一轮。
-        边流式边累积让锁定骨架路径也能实时出字——校验在流结束后进行，
-        不合格由调用方发 reset 事件清屏重来，而不是让用户对着空屏等全文。
-        """
+    async def _stream_once(self, messages: list[dict], sink: dict):
+        """执行一轮模型流并同时外发、累积正文。"""
         full = ""
         buffer = ""
-        async for content in self.llm.chat_stream(messages):
-            full += content
-            buffer += content
-            if len(buffer) >= 200 or "\n" in buffer:
-                yield {"type": "content", "data": buffer}
-                buffer = ""
+        stream = self.llm.chat_stream(messages).__aiter__()
+        pending = None
+        wait_started = time.monotonic()
+        try:
+            while True:
+                if pending is None:
+                    pending = asyncio.create_task(anext(stream))
+                done, _ = await asyncio.wait({pending}, timeout=10.0)
+                if not done:
+                    elapsed = int(time.monotonic() - wait_started)
+                    label = "返回正文" if not full else "继续生成"
+                    yield {
+                        "type": "progress",
+                        "data": f"正在等待模型{label}...（已等待 {elapsed} 秒）",
+                    }
+                    continue
+                try:
+                    content = pending.result()
+                except StopAsyncIteration:
+                    break
+                finally:
+                    pending = None
+                full += content
+                buffer += content
+                if len(buffer) >= 200 or "\n" in buffer:
+                    yield {"type": "content", "data": buffer}
+                    buffer = ""
+        finally:
+            if pending is not None and not pending.done():
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
         if buffer:
             yield {"type": "content", "data": buffer}
+        sink["content"] = full
 
-        if self.llm.last_finish_reason == "length":
-            yield {"type": "progress", "data": "输出较长，正在自动续写..."}
+    @staticmethod
+    def _report_completion_issue(content: str, expected_days: int | None = None) -> str:
+        """返回会导致报告不可交付的结构缺口；空字符串表示完整。"""
+        day_numbers = {
+            int(number)
+            for number in re.findall(
+                r"^###\s+Day\s*(\d+)\b", content or "", re.MULTILINE | re.IGNORECASE
+            )
+        }
+        if not day_numbers:
+            return "缺少分日行程"
+        if expected_days:
+            missing_days = [day for day in range(1, expected_days + 1) if day not in day_numbers]
+            if missing_days:
+                return "缺少 " + "、".join(f"Day {day}" for day in missing_days)
+        if not re.search(r"^##[^\n]*(?:总预算|预算拆解|费用汇总)", content or "", re.MULTILINE):
+            return "缺少总预算板块"
+        return ""
+
+    @staticmethod
+    def _expected_days_from_query(query: str) -> int | None:
+        match = re.search(r"(?<!\d)(\d{1,2})\s*(?:天|日)(?!\d)", query or "")
+        if not match:
+            return None
+        days = int(match.group(1))
+        return days if 1 <= days <= 60 else None
+
+    @staticmethod
+    def _expected_days_from_report(content: str) -> int | None:
+        heading = re.search(r"^#\s+[^\n]*?(\d{1,2})\s*(?:天|日)", content or "", re.MULTILINE)
+        if not heading:
+            return None
+        days = int(heading.group(1))
+        return days if 1 <= days <= 60 else None
+
+    async def _stream_events(
+        self,
+        messages: list[dict],
+        sink: dict,
+        expected_days: int | None = None,
+        validate_completion: bool = False,
+    ):
+        """流式生成正文；空流重试，截断或结构不完整时补写一次。"""
+        first_sink = {}
+        async for event in self._stream_once(messages, first_sink):
+            yield event
+        full = first_sink.get("content", "")
+
+        # 部分 OpenAI 兼容上游偶发等待到超时边缘后返回 finish_reason=length，
+        # 但没有任何 delta 内容。此时数据采集结果仍然有效，只重试正文模型，
+        # 不让请求以“空报告”结束并把页面直接复位。
+        if not full.strip():
+            logger.warning(
+                "报告模型返回空流，自动重试一次 finish=%s",
+                self.llm.last_finish_reason,
+            )
+            yield {
+                "type": "progress",
+                "data": "模型暂未返回正文，正在自动重试（无需重新采集数据）...",
+            }
+            retry_sink = {}
+            async for event in self._stream_once(messages, retry_sink):
+                yield event
+            full = retry_sink.get("content", "")
+            if not full.strip():
+                if self.llm.last_finish_reason == "timeout":
+                    raise LLMClientError("模型连续两次等待正文超时，请稍后重新提交")
+                raise LLMClientError("模型连续两次未返回报告正文，请重新提交")
+
+        effective_expected_days = expected_days or self._expected_days_from_report(full)
+        should_validate = validate_completion or effective_expected_days is not None
+        completion_issue = (
+            self._report_completion_issue(full, effective_expected_days)
+            if should_validate else ""
+        )
+        needs_continuation = (
+            self.llm.last_finish_reason == "length" or bool(completion_issue)
+        )
+        if needs_continuation:
+            reason = "输出被截断" if self.llm.last_finish_reason == "length" else completion_issue
+            logger.warning("报告不完整，自动补写一次 reason=%s", reason)
+            yield {"type": "progress", "data": "报告尚未完整，正在自动补全剩余内容..."}
             continue_messages = messages + [
                 {"role": "assistant", "content": full},
-                {"role": "user", "content": "继续输出剩余内容，从中断处无缝续写，不要重复任何已输出内容，不要加任何过渡语。"},
+                {
+                    "role": "user",
+                    "content": (
+                        "继续输出剩余内容，从中断处无缝续写，不要重复任何已输出内容，"
+                        "不要加过渡语。必须补完全部 Day、总预算、预约证件、避坑提示、"
+                        "行前物品清单、行程知识图谱和免责声明。"
+                    ),
+                },
             ]
             buffer = ""
             async for content in self.llm.chat_stream(continue_messages):
@@ -257,7 +422,14 @@ class TravelGuideOrchestrator:
                     buffer = ""
             if buffer:
                 yield {"type": "content", "data": buffer}
-            # 续写轮 finish_reason 仍为 "length" 也不再继续（最多续写 1 轮）
+            # 最多补写一轮；若仍缺关键内容，不把残缺报告交付给用户。
+            effective_expected_days = expected_days or self._expected_days_from_report(full)
+            completion_issue = (
+                self._report_completion_issue(full, effective_expected_days)
+                if should_validate else ""
+            )
+            if completion_issue:
+                raise LLMClientError(f"报告自动补全后仍不完整：{completion_issue}，请重新提交")
 
         sink["content"] = full
 
@@ -272,6 +444,10 @@ class TravelGuideOrchestrator:
             {"type": "content", "data": "..."}   - 流式文本
             {"type": "error", "data": "..."}     - 错误
         """
+        generation_started = time.monotonic()
+        from services.trip_intent import classify_trip_intent
+        intent = classify_trip_intent(query)
+
         # ---------- Phase 1: 实时数据采集 + 路线规划（并行，滚动播报） ----------
         yield {"type": "progress", "data": "正在查询携程问道 · 机票酒店景点数据..."}
 
@@ -296,6 +472,12 @@ class TravelGuideOrchestrator:
                 # 脚手架耗时被问道查询完全覆盖
                 stage_started = time.monotonic()
                 try:
+                    if not intent.use_drive_planner:
+                        if intent.is_outbound:
+                            note("已识别为出境行程，跳过中国大陆自驾路线规划...")
+                        else:
+                            note("未检测到明确自驾需求，跳过驾车路线规划...")
+                        return None, "not_applicable", None
                     r, s = await plan_route(query, self.fast_llm, fallback_llm=self.llm, on_progress=note)
                     dp = None
                     if r:
@@ -303,7 +485,7 @@ class TravelGuideOrchestrator:
                         try:
                             dp = await build_day_plan(query, r, self.fast_llm)
                         except Exception:
-                            logging.getLogger("orchestrator").exception("日程脚手架生成异常，退化为仅注入路线骨架")
+                            logger.exception("日程脚手架生成异常，退化为仅注入路线骨架")
                     return r, s, dp
                 finally:
                     logger.info("stage=route_plan elapsed=%.2fs", time.monotonic() - stage_started)
@@ -311,7 +493,11 @@ class TravelGuideOrchestrator:
             async def collect_with_timing():
                 stage_started = time.monotonic()
                 try:
-                    return await collect_travel_data(query, on_progress=note)
+                    return await collect_travel_data(
+                        query,
+                        is_international=intent.is_outbound,
+                        on_progress=note,
+                    )
                 finally:
                     logger.info("stage=data_collect elapsed=%.2fs", time.monotonic() - stage_started)
 
@@ -320,7 +506,6 @@ class TravelGuideOrchestrator:
             # 正常远够用；万一 API 拥堵挂起，宁可降级也不能让页面无限等待
             plan_task = asyncio.create_task(asyncio.wait_for(plan_and_scaffold(), timeout=90.0))
 
-            import time
             start = time.monotonic()
             pending = {collect_task, plan_task}
             while pending:
@@ -344,9 +529,9 @@ class TravelGuideOrchestrator:
             try:
                 route, plan_status, day_plan = plan_task.result()
             except asyncio.TimeoutError:
-                logging.getLogger("orchestrator").error("路线规划超时（90s），降级为纯 LLM 排线")
+                logger.error("路线规划超时（90s），降级为纯 LLM 排线")
             except Exception:
-                logging.getLogger("orchestrator").exception("路线规划任务异常")
+                logger.exception("路线规划任务异常")
 
             if route:
                 travel_data["route_plan"] = route["markdown"]
@@ -377,8 +562,16 @@ class TravelGuideOrchestrator:
         # ---------- Phase 2: LLM 生成 ----------
         yield {"type": "progress", "data": "AI 正在分析数据并规划行程..."}
 
-        user_message = build_user_message(query, travel_data)
-        system_message = SYSTEM_PROMPT
+        user_message = build_user_message(query, travel_data, mode=self.mode)
+        system_message = get_system_prompt(self.mode)
+        logger.info(
+            "stage=prompt mode=%s outbound=%s self_drive=%s system_chars=%d user_chars=%d",
+            self.mode,
+            intent.is_outbound,
+            intent.is_self_drive,
+            len(system_message),
+            len(user_message),
+        )
 
         messages = [
             {"role": "system", "content": system_message},
@@ -386,6 +579,7 @@ class TravelGuideOrchestrator:
         ]
 
         try:
+            report_started = time.monotonic()
             if day_plan:
                 # 锁定骨架路径只生成一次完整草稿。标题偏差由程序按骨架
                 # 确定性修正；其他结构问题只告警并继续输出当前完整版本。
@@ -432,12 +626,24 @@ class TravelGuideOrchestrator:
                         "data": "行程结构校验未完全通过，已保留完整草稿并继续生成文档...",
                     }
             else:
-                yield {"type": "progress", "data": "AI 正在生成详细攻略..."}
+                label = "标准版" if self.mode == "standard" else "专业版"
+                yield {"type": "progress", "data": f"AI 正在生成{label}攻略..."}
                 sink = {}
-                async for event in self._stream_events(messages, sink):
+                async for event in self._stream_events(
+                    messages,
+                    sink,
+                    expected_days=self._expected_days_from_query(query),
+                    validate_completion=True,
+                ):
                     yield event
 
             yield {"type": "progress", "data": "正在生成精美文档..."}
+            logger.info(
+                "stage=report_generation mode=%s elapsed=%.2fs total_elapsed=%.2fs",
+                self.mode,
+                time.monotonic() - report_started,
+                time.monotonic() - generation_started,
+            )
 
         except LLMClientError as e:
             yield {"type": "error", "data": str(e)}

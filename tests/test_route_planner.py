@@ -273,7 +273,7 @@ def test_fast_extraction_failure_retries_with_pro_model(monkeypatch, isolated_db
     monkeypatch.setattr(route_planner, "_plan_geo", fake_geo)
 
     route, status = asyncio.run(
-        route_planner.plan_route("独一无二的回退测试需求", fast, fallback_llm=pro)
+        route_planner.plan_route("独一无二的自驾回退测试需求", fast, fallback_llm=pro)
     )
 
     assert status == "ok"
@@ -282,3 +282,20 @@ def test_fast_extraction_failure_retries_with_pro_model(monkeypatch, isolated_db
         ("deepseek-v4-flash", route_planner._FAST_EXTRACT_TIMEOUT),
         ("deepseek-v4-pro", route_planner._FALLBACK_EXTRACT_TIMEOUT),
     ]
+
+
+def test_route_planner_skips_outbound_before_calling_llm(monkeypatch):
+    from services import route_planner
+
+    async def should_not_extract(*args, **kwargs):
+        raise AssertionError("出境请求不应进入自驾途经点抽取")
+
+    monkeypatch.setenv("AMAP_WEB_SERVICE_KEY", "test-key")
+    monkeypatch.setattr(route_planner, "_extract_stops", should_not_extract)
+
+    route, status = asyncio.run(
+        route_planner.plan_route("日本北海道租车自驾7天", object())
+    )
+
+    assert route is None
+    assert status == "not_applicable"

@@ -46,9 +46,13 @@ async def collect_travel_data(
     if dest:
         # 1. 交通查询
         if org:
-            transport_query = f"{org}到{dest}交通方式，机票价格和火车票信息"
+            if is_international:
+                transport_query = f"{org}到{dest}国际交通方式，航班价格、入境和转乘信息"
+            else:
+                transport_query = f"{org}到{dest}交通方式，机票价格和火车票信息"
         else:
-            transport_query = f"到{dest}的交通方式和机票价格"
+            qualifier = "国际交通方式、航班价格和入境信息" if is_international else "交通方式和机票价格"
+            transport_query = f"到{dest}的{qualifier}"
         hotel_query = f"{dest}{day_info}酒店推荐，不同价位选择"
         attraction_query = f"{dest}{day_info}热门景点门票价格和预约规则"
         tips_query = f"{dest}{day_info}旅游攻略，天气穿搭建议，注意事项，必吃美食"
@@ -99,9 +103,9 @@ async def collect_travel_data(
         _notify("高德位置与周边数据就绪")
 
     pending_tasks = [asyncio.create_task(run_wendao())]
-    if org and dest:
+    if org and dest and not is_international:
         pending_tasks.append(asyncio.create_task(run_train()))
-    if dest:
+    if dest and not is_international:
         pending_tasks.append(asyncio.create_task(run_amap()))
 
     done, still_pending = await asyncio.wait(pending_tasks, timeout=deadline)

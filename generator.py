@@ -129,7 +129,64 @@ def normalize_report_markdown(markdown_content: str) -> str:
             body = f"```\n{_normalize_knowledge_graph(body)}\n```"
         return heading + body.strip() + "\n\n"
 
-    return section_re.sub(normalize_section, markdown_content)
+    normalized = section_re.sub(normalize_section, markdown_content)
+    normalized = _ensure_report_disclaimer(normalized)
+    return _position_report_duration_before_disclaimer(normalized)
+
+
+_REPORT_DURATION_LINE_RE = re.compile(
+    r"^>\s*本报告生成耗时\d+分\d+秒\s*$", re.MULTILINE
+)
+_DISCLAIMER_LINE_RE = re.compile(
+    r"^>\s*(?:⚠️?\s*)?(?:\*\*)?(?:免责声明|免责申明)", re.MULTILINE
+)
+_DISCLAIMER_FULL_LINE_RE = re.compile(
+    r"^>\s*(?:⚠️?\s*)?(?:\*\*)?(?:免责声明|免责申明).*?$",
+    re.MULTILINE,
+)
+
+
+def _ensure_report_disclaimer(markdown_content: str) -> str:
+    """免责声明是固定收尾，可确定性补齐，无需消耗模型续写。"""
+    disclaimers = list(_DISCLAIMER_FULL_LINE_RE.finditer(markdown_content))
+    if disclaimers:
+        # 历史报告可能因带图标的免责声明未被识别而被追加第二份；只保留第一份。
+        if len(disclaimers) == 1:
+            return markdown_content
+        first = disclaimers[0]
+        pieces = [markdown_content[:first.end()]]
+        cursor = first.end()
+        for duplicate in disclaimers[1:]:
+            pieces.append(markdown_content[cursor:duplicate.start()])
+            cursor = duplicate.end()
+        pieces.append(markdown_content[cursor:])
+        return re.sub(r"\n{3,}", "\n\n", "".join(pieces))
+    return (
+        markdown_content.rstrip()
+        + "\n\n> **免责声明**：本攻略基于实时查询与公开资料整理，"
+        "票价、营业时间、预约政策和路况可能变化，出行前请以官方最新信息为准。\n"
+    )
+
+
+def _position_report_duration_before_disclaimer(markdown_content: str) -> str:
+    """确保耗时在免责声明前显示，同时兼容已保存的旧位置。"""
+    duration_lines = _REPORT_DURATION_LINE_RE.findall(markdown_content)
+    if not duration_lines:
+        return markdown_content
+
+    suffix = "\n" if markdown_content.endswith("\n") else ""
+    duration_line = duration_lines[-1].strip()
+    without_duration = _REPORT_DURATION_LINE_RE.sub("", markdown_content)
+    without_duration = re.sub(r"\n{3,}", "\n\n", without_duration).strip()
+    disclaimer = _DISCLAIMER_LINE_RE.search(without_duration)
+
+    if disclaimer:
+        before = without_duration[:disclaimer.start()].rstrip()
+        after = without_duration[disclaimer.start():].lstrip()
+        parts = [part for part in (before, duration_line, after) if part]
+    else:
+        parts = [part for part in (without_duration, duration_line) if part]
+    return "\n\n".join(parts).rstrip() + suffix
 
 
 def _canonicalize_headings(markdown_content: str) -> str:
@@ -221,8 +278,15 @@ def _normalize_and_order_sections(markdown_content: str) -> str:
         else:
             unknown.append(f"## {title}\n\n{body}".strip())
 
-    # 小型 Markdown 片段保持原样；完整攻略才启用固定九板块契约。
-    if len(set(recognized_keys)) < 5:
+    # 小型 Markdown 片段保持原样。带一级标题、Day 行程且至少识别到两个
+    # 顶级板块的内容已具备完整攻略形态，不能再依赖“识别到 5 个板块”才补全，
+    # 否则模型截断或标题轻微偏差会让尾部必需板块永久缺失。
+    has_report_shape = bool(re.search(r"^#\s+.+", markdown_content, re.MULTILINE)) and bool(
+        re.search(r"^###\s+Day\s*\d+\b", markdown_content, re.MULTILINE | re.IGNORECASE)
+    )
+    if len(set(recognized_keys)) < 5 and not (
+        has_report_shape and len(set(recognized_keys)) >= 2
+    ):
         return markdown_content
 
     parts = [preamble] if preamble else []
@@ -231,14 +295,57 @@ def _normalize_and_order_sections(markdown_content: str) -> str:
         if not bodies and key not in _REQUIRED_SECTIONS:
             continue
         body = "\n\n".join(part for part in bodies if part).strip()
-        if not body:
-            body = "> 本板块未生成有效内容，请以官方实时信息为准。"
+        legacy_empty = (
+            key in {"packing", "knowledge"}
+            and "本板块未生成有效内容" in body
+        )
+        if not body or legacy_empty:
+            body = _required_section_fallback(key, markdown_content)
         parts.append(f"## {_SECTION_TITLES[key]}\n\n{body}")
         if key == "packing" and unknown:
             parts.extend(unknown)
             unknown = []
     parts.extend(unknown)
     return "\n\n".join(parts).rstrip() + "\n"
+
+
+def _required_section_fallback(section_key: str, markdown_content: str) -> str:
+    """为可从现有行程确定性推导的板块生成有效内容。"""
+    if section_key == "packing":
+        travelers_match = re.search(r"为\s*(\d+)\s*人定制", markdown_content)
+        travelers = max(1, int(travelers_match.group(1))) if travelers_match else 1
+        documents = f"身份证×{travelers}、电子订单与预约凭证"
+        if re.search(r"出境须知|护照|签证|境外", markdown_content):
+            documents = f"护照×{travelers}、签证/入境材料×{travelers}、身份证×{travelers}"
+        rows = [
+            ("📄 证件", documents),
+            ("🧥 衣物", f"按天数准备换洗衣物、舒适步行鞋×{travelers}双、轻薄外套×{travelers}"),
+            ("💊 药品", "常用药、肠胃药、创可贴、个人处方药"),
+            ("🧴 防护", f"晴雨伞×{travelers}、防晒霜、驱蚊用品、纸巾"),
+            ("📱 电子", f"手机×{travelers}、充电器×{travelers}、充电宝×{travelers}"),
+        ]
+        if re.search(r"自驾|驾驶|行驶证", markdown_content):
+            rows.append(("🚗 车载", "驾驶证、行驶证、车辆保险、充气泵、急救包"))
+        table = ["| 类别 | 物品（写出具体数量） |", "|------|---------------------|"]
+        table.extend(f"| {category} | {items} |" for category, items in rows)
+        return "\n".join(table)
+
+    if section_key == "knowledge":
+        day_matches = re.findall(
+            r"^###\s+Day\s*(\d+)\s*(?:[·.：:\-—]\s*)?([^\n]*)$",
+            markdown_content,
+            re.MULTILINE | re.IGNORECASE,
+        )
+        if day_matches:
+            graph = ["```", "[行程总览]"]
+            for index, (day, theme) in enumerate(day_matches):
+                branch = "└──" if index == len(day_matches) - 1 else "├──"
+                label = theme.strip(" ·.-—") or "按计划游览"
+                graph.append(f"{branch} Day {int(day)} · {label}")
+            graph.append("```")
+            return "\n".join(graph)
+
+    return "> 本板块未生成有效内容，请以官方实时信息为准。"
 
 
 def _normalize_section_tables(body: str, section_key: str) -> str:
@@ -317,7 +424,7 @@ def _normalize_knowledge_graph(content: str) -> str:
         rf"\s*{branch_marker}\s*(?=🏁)", "\n@@FINISH@@", text
     )
     text = re.sub(
-        r"(?<!@@DAY@@)(?<!^)[ \t]+(?=Day\s*\d+\s*[·.])",
+        r"(?<!@@DAY@@)(?<!^)[ \t]+(?=Day\s*\d+\b)",
         "\n@@DAY@@",
         text,
         flags=re.IGNORECASE,

@@ -291,11 +291,57 @@ def test_full_report_missing_sections_receive_stable_fallbacks():
 
     normalized = normalize_report_markdown(markdown)
 
-    assert normalized.count("本板块未生成有效内容") == 4
+    assert normalized.count("本板块未生成有效内容") == 2
     assert "## 🚨 必做预约 & 证件清单" in normalized
     assert "## ⚠️ 避坑提示" in normalized
     assert "## 🎒 行前物品清单" in normalized
     assert "## 🌳 行程知识图谱" in normalized
+    assert "| 📄 证件 | 身份证×1、电子订单与预约凭证 |" in normalized
+    assert "├── Day 1 · 测试" not in normalized
+    assert "└── Day 1 · 测试" in normalized
+
+
+def test_missing_packing_and_knowledge_are_derived_from_standard_report():
+    markdown = (
+        "# 成都2日游 · 为2人定制\n\n"
+        "## 天气与穿搭\n天气\n\n"
+        "## 城际交通建议\n交通\n\n"
+        "## 住宿推荐\n住宿\n\n"
+        "## 分日行程\n"
+        "### Day 1 · 春熙路城市漫游\n安排\n\n"
+        "### Day 2 · 熊猫基地与返程\n安排\n\n"
+        "## 总预算拆解\n预算\n\n"
+        "## 行前物品清单\n> 本板块未生成有效内容，请以官方实时信息为准。\n\n"
+        "## 行程知识图谱\n> 本板块未生成有效内容，请以官方实时信息为准。\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    packing = normalized.split("## 🎒 行前物品清单", 1)[1].split("## 🌳 行程知识图谱", 1)[0]
+    knowledge = normalized.split("## 🌳 行程知识图谱", 1)[1]
+    assert "本板块未生成有效内容" not in packing
+    assert "身份证×2" in packing
+    assert "本板块未生成有效内容" not in knowledge
+    assert "├── Day 1 · 春熙路城市漫游" in knowledge
+    assert "└── Day 2 · 熊猫基地与返程" in knowledge
+
+
+def test_report_shape_with_only_itinerary_and_budget_still_gets_required_sections():
+    markdown = (
+        "# 成都2日游 · 为2人定制\n\n"
+        "## 分日行程\n"
+        "### Day 1 · 春熙路\n安排\n\n"
+        "### Day 2 · 熊猫基地\n安排\n\n"
+        "## 总预算\n人均约¥1000\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert "## 🎒 行前物品清单" in normalized
+    assert "身份证×2" in normalized
+    assert "## 🌳 行程知识图谱" in normalized
+    assert "├── Day 1 · 春熙路" in normalized
+    assert "└── Day 2 · 熊猫基地" in normalized
 
 
 def test_heading_with_own_emoji_does_not_get_extra_icon():
@@ -623,6 +669,59 @@ def test_disclaimer_truncates_followup_content(gen):
     assert "免责声明" in html
     assert "是否需要调整" not in html
     assert "AI 旅行攻略生成器" not in html
+
+
+def test_report_duration_after_disclaimer_is_moved_and_rendered(gen):
+    markdown = (
+        "# 🗺️ 成都3日游\n\n"
+        "正文\n\n"
+        "> **免责声明**：请以官方实时信息为准。\n\n"
+        "- 是否需要调整某天的景点？\n\n"
+        "> 本报告生成耗时0分55秒\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+    html = gen.to_html(markdown, "duration-before-disclaimer")
+
+    assert normalized.index("本报告生成耗时") < normalized.index("免责声明")
+    assert "本报告生成耗时0分55秒" in html
+    assert "是否需要调整" not in html
+
+
+def test_missing_disclaimer_is_added_deterministically():
+    markdown = "# 成都2日游\n\n## 分日行程\n### Day 1 · 市区漫游\n安排\n"
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert "免责声明" in normalized
+    assert "票价、营业时间、预约政策和路况可能变化" in normalized
+
+
+def test_icon_disclaimer_is_recognized_and_duplicates_are_removed():
+    markdown = (
+        "# 成都2日游\n\n正文\n\n"
+        "> ⚠️ 免责声明：请以官方实时信息为准。\n\n"
+        "> **免责声明**：重复内容。\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert normalized.count("免责声明") == 1
+    assert "请以官方实时信息为准" in normalized
+    assert "重复内容" not in normalized
+
+
+def test_knowledge_graph_splits_unmarked_day_tokens_onto_separate_lines():
+    markdown = (
+        "# 成都3日游\n\n## 行程知识图谱\n```\n"
+        "└── Day1 抵达成都 Day2 熊猫基地 Day3 返程武汉\n```\n"
+    )
+
+    normalized = normalize_report_markdown(markdown)
+
+    assert "├── Day1 抵达成都\n" in normalized
+    assert "├── Day2 熊猫基地\n" in normalized
+    assert "└── Day3 返程武汉" in normalized
 
 
 def test_to_html_does_not_embed_homepage_logo(gen):

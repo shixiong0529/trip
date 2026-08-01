@@ -24,7 +24,7 @@ import time
 import unicodedata
 from typing import Any, Optional
 
-logger = logging.getLogger("route_planner")
+logger = logging.getLogger("uvicorn.error.route_planner")
 
 import httpx
 from dotenv import load_dotenv
@@ -236,6 +236,11 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
 
     llm 需提供 chat_stream(messages) 异步生成器（orchestrator.LLMClient）。
     """
+    from services.trip_intent import should_use_drive_planner
+
+    if not should_use_drive_planner(query):
+        logger.info("需求不是中国大陆明确自驾，跳过驾车路线规划")
+        return None, "not_applicable"
     if not os.getenv("AMAP_WEB_SERVICE_KEY", "").strip():
         logger.info("未配置 AMAP_WEB_SERVICE_KEY，跳过路线规划")
         return None, "not_applicable"

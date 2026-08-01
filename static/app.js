@@ -30,6 +30,11 @@
     streamOutput: $('#stream-output'),
     guidePreview: $('#guide-preview'),
     guideIdLabel: $('#guide-id-label'),
+    generationModeSwitch: $('#generation-mode-switch'),
+    generationModeOptions: $$('.mode-option[data-generation-mode]'),
+    modeDescription: $('#mode-description'),
+    generatingNote: $('#generating-note'),
+    generationError: $('#generation-error'),
     statusBar: $('#status-bar'),
     statusDot: $('#status-dot'),
     statusText: $('#status-text'),
@@ -47,6 +52,7 @@
     generationRunId: 0,
     activeTab: 'generate', // generate | trips；切换页面时保留真实生成状态
     pdfReady: true,      // 由 /api/health 的 pdf_ready 更新，决定 PDF 下载按钮是否可用
+    generationMode: 'standard', // standard | professional；刷新后始终默认标准版
   };
 
   // 旧版本曾把 API Key 保存在浏览器中；现在统一使用服务端配置并清理遗留敏感数据。
@@ -98,6 +104,11 @@
   // ====== 模式切换 ======
   function setMode(mode) {
     state.mode = mode;
+    const generationLocked = mode === 'generating';
+    if (els.generationModeSwitch) els.generationModeSwitch.disabled = generationLocked;
+    els.generationModeOptions.forEach(function(option) {
+      option.disabled = generationLocked;
+    });
     if (state.activeTab === 'trips') {
       els.inputSection.style.display = 'none';
       els.generatingSection.style.display = 'none';
@@ -111,6 +122,28 @@
     els.tripsSection.style.display = 'none';
     if (mode === 'done') {
       updatePdfButtonState();
+    }
+  }
+
+  function setGenerationMode(mode) {
+    if (state.mode === 'generating') return;
+    state.generationMode = mode === 'professional' ? 'professional' : 'standard';
+    const professional = state.generationMode === 'professional';
+    if (els.generationModeSwitch) {
+      els.generationModeSwitch.classList.toggle('professional', professional);
+      els.generationModeSwitch.setAttribute('aria-checked', professional ? 'true' : 'false');
+      els.generationModeSwitch.setAttribute(
+        'aria-label',
+        professional ? '切换为标准版' : '切换为专业版'
+      );
+    }
+    els.generationModeOptions.forEach(function(option) {
+      option.classList.toggle('active', option.dataset.generationMode === state.generationMode);
+    });
+    if (els.modeDescription) {
+      els.modeDescription.textContent = professional
+        ? '信息最完整，保留全部详细板块，生成时间较长'
+        : '更快生成，保留核心行程、预算和避坑信息';
     }
   }
 
@@ -136,6 +169,18 @@
       toast.style.transition = 'opacity 0.3s ease';
       setTimeout(function() { toast.remove(); }, 300);
     }, 3000);
+  }
+
+  function clearGenerationError() {
+    if (!els.generationError) return;
+    els.generationError.textContent = '';
+    els.generationError.style.display = 'none';
+  }
+
+  function showGenerationError(message) {
+    if (!els.generationError) return;
+    els.generationError.textContent = message;
+    els.generationError.style.display = 'block';
   }
 
   function scrollPageToTop() {
@@ -164,6 +209,7 @@
     }
 
     setMode('generating');
+    clearGenerationError();
     scrollPageToTop();
     els.streamOutput.textContent = '';
     state.guideMarkdown = null;
@@ -174,7 +220,12 @@
     const controller = new AbortController();
     state.abortController = controller;
 
-    const body = { query: query };
+    if (els.generatingNote) {
+      els.generatingNote.textContent = state.generationMode === 'professional'
+        ? '专业版内容更完整，生成时间较长'
+        : '标准版通常可更快生成';
+    }
+    const body = { query: query, mode: state.generationMode };
 
     try {
       const res = await fetch('/api/generate', {
@@ -188,7 +239,9 @@
 
       if (!res.ok) {
         const errText = await res.text();
-        showToast('请求失败: ' + (errText || res.statusText), 'error');
+        const message = '请求失败: ' + (errText || res.statusText);
+        showToast(message, 'error');
+        showGenerationError(message);
         setMode('idle');
         return;
       }
@@ -199,6 +252,7 @@
       let currentEvent = '';
       let dataLines = [];
       let aborted = false;
+      let failureMessage = '';
 
       // 按 SSE 规范：一个事件可含多个 data: 行（对应内容中的换行），空行表示事件结束
       function dispatchEvent() {
@@ -230,6 +284,7 @@
             state.guideHtml = result.html || null;
           } catch (e) { /* ignore */ }
         } else if (currentEvent === 'error') {
+          failureMessage = payload || '报告生成失败，请重新提交';
           showToast(payload, 'error');
           aborted = true;
         }
@@ -260,6 +315,7 @@
         }
 
         if (aborted) {
+          showGenerationError(failureMessage || '报告生成失败，请重新提交');
           setMode('idle');
           return;
         }
@@ -272,7 +328,9 @@
       if (state.guideId) {
         renderGuide();
       } else {
-        showToast('生成未返回有效结果', 'error');
+        const message = '生成未返回有效结果，请重新提交';
+        showToast(message, 'error');
+        showGenerationError(message);
         setMode('idle');
       }
     } catch (e) {
@@ -282,7 +340,9 @@
         setMode('idle');
         return;
       }
-      showToast('生成失败: ' + e.message, 'error');
+      const message = '生成失败: ' + e.message;
+      showToast(message, 'error');
+      showGenerationError(message);
       setMode('idle');
     }
   }
@@ -345,6 +405,17 @@
 
   // ====== 事件绑定 ======
   els.btnGenerate.addEventListener('click', startGeneration);
+
+  if (els.generationModeSwitch) {
+    els.generationModeSwitch.addEventListener('click', function() {
+      setGenerationMode(state.generationMode === 'standard' ? 'professional' : 'standard');
+    });
+  }
+  els.generationModeOptions.forEach(function(option) {
+    option.addEventListener('click', function() {
+      setGenerationMode(option.dataset.generationMode);
+    });
+  });
 
   els.queryInput.addEventListener('keydown', function(e) {
     if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
@@ -410,6 +481,7 @@
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         destination: dest,
+        guide_id: state.guideId,
         markdown: state.guideMarkdown || '',
       }),
     }).then(function(r) { return r.json(); })
@@ -484,6 +556,7 @@
   function init() {
     clearLegacyConfig();
     checkHealth();
+    setGenerationMode('standard');
     setMode('idle');
 
     // 点击状态条重新检测服务状态

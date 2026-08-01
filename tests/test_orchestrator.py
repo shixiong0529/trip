@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import suppress
 import json
+import time
 import pytest
 
 from orchestrator import LLMClient, TravelGuideOrchestrator, LLMClientError
@@ -24,6 +25,25 @@ def test_orchestrator_wires_config_max_tokens(monkeypatch):
     payload = orch.llm._build_payload([{"role": "user", "content": "hi"}])
     assert payload["max_tokens"] == 12345
     assert payload["temperature"] == 0.55
+
+
+def test_standard_mode_caps_report_tokens_and_professional_keeps_config(monkeypatch):
+    import config
+    monkeypatch.setattr(config.llm_config, "max_tokens", 16384)
+
+    standard = TravelGuideOrchestrator(
+        "https://api.example.com/v1", "k", "m", mode="standard"
+    )
+    professional = TravelGuideOrchestrator(
+        "https://api.example.com/v1", "k", "m", mode="professional"
+    )
+
+    assert standard.llm.max_tokens == 10000
+    assert professional.llm.max_tokens == 16384
+    assert standard.llm.first_token_timeout == 45
+    assert standard.llm.stream_timeout == 75
+    assert professional.llm.first_token_timeout == 75
+    assert professional.llm.stream_timeout == 180
 
 
 def test_orchestrator_rejects_empty_key():
@@ -61,7 +81,7 @@ def test_cancelled_generation_cancels_data_collection_and_route_tasks(monkeypatc
 
     async def scenario():
         orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m")
-        stream = orchestrator.generate("测试取消")
+        stream = orchestrator.generate("测试自驾取消")
         first = await anext(stream)
         assert first["type"] == "progress"
 
@@ -196,6 +216,92 @@ def test_chat_json_does_not_treat_reasoning_as_final_json(monkeypatch):
         asyncio.run(client.chat_json([{"role": "user", "content": "extract"}]))
 
 
+def test_chat_stream_stops_when_first_token_deadline_expires(monkeypatch):
+    class SlowStreamResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aiter_lines(self):
+            await asyncio.sleep(1)
+            yield 'data: {"choices":[{"delta":{"content":"太迟"}}]}'
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, *args, **kwargs):
+            return SlowStreamResponse()
+
+    monkeypatch.setattr("orchestrator.httpx.AsyncClient", FakeClient)
+    client = LLMClient(
+        "https://api.example.com/v1",
+        "k",
+        "slow",
+        first_token_timeout=0.02,
+        stream_timeout=0.1,
+    )
+
+    async def consume():
+        return [chunk async for chunk in client.chat_stream([{"role": "user", "content": "报告"}])]
+
+    started = time.monotonic()
+    chunks = asyncio.run(consume())
+
+    assert chunks == []
+    assert client.last_finish_reason == "timeout"
+    assert time.monotonic() - started < 0.3
+
+
+def test_chat_stream_disables_thinking_mode(monkeypatch):
+    captured = []
+
+    class DoneResponse:
+        status_code = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def aiter_lines(self):
+            yield "data: [DONE]"
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        def stream(self, method, url, json, headers):
+            captured.append(json)
+            return DoneResponse()
+
+    monkeypatch.setattr("orchestrator.httpx.AsyncClient", FakeClient)
+    client = LLMClient("https://api.example.com/v1", "k", "report")
+
+    async def consume():
+        return [chunk async for chunk in client.chat_stream([{"role": "user", "content": "报告"}])]
+
+    assert asyncio.run(consume()) == []
+    assert captured[0]["thinking"] == {"type": "disabled"}
+
+
 def test_locked_day_plan_never_regenerates_entire_report(monkeypatch):
     """结构校验失败也必须继续做 HTML，不能再次调用主模型生成整篇报告。"""
     calls = 0
@@ -237,7 +343,7 @@ def test_locked_day_plan_never_regenerates_entire_report(monkeypatch):
     orchestrator.llm = FakeReportLLM()
 
     async def consume():
-        return [event async for event in orchestrator.generate("测试锁定骨架")]
+        return [event async for event in orchestrator.generate("测试自驾锁定骨架")]
 
     events = asyncio.run(consume())
 
@@ -247,3 +353,145 @@ def test_locked_day_plan_never_regenerates_entire_report(monkeypatch):
         for event in events
     )
     assert events[-1] == {"type": "progress", "data": "正在生成精美文档..."}
+
+
+def test_empty_report_stream_retries_once_without_recollecting_data():
+    class EmptyThenSuccessLLM:
+        last_finish_reason = None
+
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                self.last_finish_reason = "length"
+                return
+            self.last_finish_reason = "stop"
+            yield "# 重试成功\n\n## 总预算\n预算\n\n> 免责声明：请核实"
+
+    orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m", mode="standard")
+    orchestrator.llm = EmptyThenSuccessLLM()
+    sink = {}
+
+    async def consume():
+        return [
+            event
+            async for event in orchestrator._stream_events(
+                [{"role": "user", "content": "生成报告"}], sink
+            )
+        ]
+
+    events = asyncio.run(consume())
+
+    assert orchestrator.llm.calls == 2
+    assert sink["content"] == "# 重试成功\n\n## 总预算\n预算\n\n> 免责声明：请核实"
+    assert any("正在自动重试" in event["data"] for event in events)
+    assert any("# 重试成功" in event.get("data", "") for event in events)
+
+
+def test_two_empty_report_streams_raise_clear_error():
+    class AlwaysEmptyLLM:
+        last_finish_reason = "length"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(self, messages):
+            self.calls += 1
+            self.last_finish_reason = "length"
+            if False:
+                yield ""
+
+    orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m", mode="standard")
+    orchestrator.llm = AlwaysEmptyLLM()
+
+    async def consume():
+        return [
+            event
+            async for event in orchestrator._stream_events(
+                [{"role": "user", "content": "生成报告"}], {}
+            )
+        ]
+
+    with pytest.raises(LLMClientError, match="连续两次未返回报告正文"):
+        asyncio.run(consume())
+    assert orchestrator.llm.calls == 2
+
+
+def test_truncated_standard_report_continues_and_requires_all_days():
+    class PartialThenCompleteLLM:
+        last_finish_reason = None
+
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                self.last_finish_reason = "length"
+                yield "# 成都2日游\n\n## 分日行程\n### Day 1 · 市区漫游\n安排\n"
+                return
+            self.last_finish_reason = "stop"
+            yield (
+                "\n### Day 2 · 熊猫基地\n安排\n\n"
+                "## 总预算\n预算\n\n> 免责声明：请以官方信息为准。"
+            )
+
+    orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m", mode="standard")
+    orchestrator.llm = PartialThenCompleteLLM()
+    sink = {}
+
+    async def consume():
+        return [
+            event
+            async for event in orchestrator._stream_events(
+                [{"role": "user", "content": "成都旅行"}],
+                sink,
+                validate_completion=True,
+            )
+        ]
+
+    events = asyncio.run(consume())
+
+    assert orchestrator.llm.calls == 2
+    assert "### Day 1" in sink["content"]
+    assert "### Day 2" in sink["content"]
+    assert "## 总预算" in sink["content"]
+    assert any("自动补全" in event.get("data", "") for event in events)
+
+
+def test_expected_days_can_be_recovered_from_report_heading():
+    content = "# 成都 12 日行程 · 为2人定制\n\n## 分日行程\n### Day 1 · 出发"
+
+    assert TravelGuideOrchestrator._expected_days_from_report(content) == 12
+    assert TravelGuideOrchestrator._report_completion_issue(content, 12).startswith("缺少 Day 2")
+    assert TravelGuideOrchestrator._report_completion_issue("# 成都游\n\n## 总预算\n预算") == "缺少分日行程"
+
+
+def test_incomplete_continuation_is_rejected_instead_of_saved():
+    class StillIncompleteLLM:
+        last_finish_reason = None
+
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(self, messages):
+            self.calls += 1
+            self.last_finish_reason = "length" if self.calls == 1 else "stop"
+            yield "# 成都2日游\n\n## 分日行程\n### Day 1 · 市区漫游\n安排"
+
+    orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m", mode="standard")
+    orchestrator.llm = StillIncompleteLLM()
+
+    async def consume():
+        return [
+            event
+            async for event in orchestrator._stream_events(
+                [{"role": "user", "content": "成都2日游"}], {}, expected_days=2
+            )
+        ]
+
+    with pytest.raises(LLMClientError, match="仍不完整：缺少 Day 2"):
+        asyncio.run(consume())
+    assert orchestrator.llm.calls == 2

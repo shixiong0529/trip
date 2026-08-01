@@ -65,6 +65,12 @@ def test_generate_rejects_query_over_2000_characters():
     assert resp.status_code == 400
 
 
+@pytest.mark.parametrize("mode", ["turbo", "", 123, None])
+def test_generate_rejects_invalid_generation_mode(mode):
+    resp = client.post("/api/generate", json={"query": "北京3日游", "mode": mode})
+    assert resp.status_code == 400
+
+
 # ---------- 下载 ----------
 
 def test_download_missing_guide_returns_404():
@@ -143,6 +149,39 @@ def test_save_trip_persists_corrected_daily_budget():
     saved = client.get(f"/api/trips/{response.json()['trip_id']}").json()
 
     assert "3人合计约¥2,838" in saved["markdown"]
+
+
+def test_save_trip_prefers_final_guide_markdown(isolated_db):
+    isolated_db.save_guide(
+        "final-guide",
+        "<html>final</html>",
+        "# 成都4日游\n\n最终正文\n\n> 本报告生成耗时0分55秒\n",
+    )
+
+    response = client.post(
+        "/api/trips",
+        json={
+            "destination": "成都",
+            "guide_id": "final-guide",
+            "markdown": "# 成都4日游\n\n尚未追加耗时的流式正文",
+        },
+    )
+
+    assert response.status_code == 200
+    saved = client.get(f"/api/trips/{response.json()['trip_id']}").json()
+    assert "最终正文" in saved["markdown"]
+    assert "本报告生成耗时0分55秒" in saved["markdown"]
+    assert "尚未追加耗时" not in saved["markdown"]
+
+
+def test_save_trip_rejects_non_text_guide_id():
+    response = client.post(
+        "/api/trips",
+        json={"destination": "成都", "guide_id": {"bad": "value"}, "markdown": ""},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "攻略编号必须是文本"
 
 
 def test_view_trip_200_and_404():

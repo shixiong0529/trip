@@ -71,8 +71,24 @@ def test_generation_frontend_isolates_cancelled_requests():
 
     assert "generationRunId" in app_js
     assert "if (state.mode === 'generating') return" in app_js
-    assert "const body = { query: query }" in app_js
+    assert "const body = { query: query, mode: state.generationMode }" in app_js
     assert "state.config" not in app_js
+
+
+def test_homepage_defaults_to_standard_mode_and_exposes_accessible_switch():
+    index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert 'id="generation-mode-switch"' in index
+    assert 'role="switch"' in index
+    assert 'aria-checked="false"' in index
+    assert 'data-generation-mode="standard"' in index
+    assert 'data-generation-mode="professional"' in index
+    assert "generationMode: 'standard'" in app_js
+    assert "setGenerationMode('standard')" in app_js
+    assert ".mode-switch.professional" in css
+    assert ".mode-switch-knob" in css
 
 
 def test_generation_tab_switch_preserves_the_real_generation_mode():
@@ -152,3 +168,24 @@ def test_mobile_result_title_and_guide_id_use_separate_rows():
     assert ".result-badge { white-space: nowrap; }" in mobile
     assert "overflow-wrap: anywhere" in mobile
     assert "mobile-result-header" in index
+
+
+def test_save_trip_sends_final_guide_id():
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert "guide_id: state.guideId" in app_js
+    assert "app.js?v=20260801-report-duration-save" in index
+
+
+def test_generation_failure_remains_visible_after_returning_to_form():
+    index = (ROOT / "static" / "index.html").read_text(encoding="utf-8")
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+    css = (ROOT / "static" / "style.css").read_text(encoding="utf-8")
+
+    assert 'id="generation-error"' in index
+    assert 'role="alert"' in index
+    assert "function showGenerationError(message)" in app_js
+    assert "showGenerationError(failureMessage" in app_js
+    assert ".generation-error" in css
+    assert "generation-recovery" in index

@@ -126,3 +126,32 @@ def test_collect_travel_data_train_empty_when_query_fails(monkeypatch):
 
     data = asyncio.run(collect_travel_data("武汉出发自驾西藏15天"))
     assert data["train"] == ""
+
+
+def test_international_collection_skips_12306_and_amap(monkeypatch):
+    captured_questions = []
+
+    class CapturingClient:
+        async def query_many(self, questions):
+            captured_questions.extend(questions)
+            return [f"[假数据] {q}" for q in questions]
+
+    async def should_not_run(*args, **kwargs):
+        raise AssertionError("出境行程不应查询中国大陆铁路或高德驾车数据")
+
+    monkeypatch.setattr(
+        "services.data_collector.get_ctrip_client", lambda: CapturingClient()
+    )
+    monkeypatch.setattr("services.data_collector._query_train_reference", should_not_run)
+    monkeypatch.setattr("services.data_collector._query_amap_reference", should_not_run)
+
+    data = asyncio.run(collect_travel_data(
+        "武汉出发去日本7天",
+        destination="日本",
+        origin="武汉",
+        is_international=True,
+    ))
+
+    assert data["train"] == ""
+    assert data["amap"] == ""
+    assert any("国际交通方式" in question for question in captured_questions)

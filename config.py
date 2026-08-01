@@ -26,6 +26,24 @@ class LLMConfig:
         # 结构化长报告优先保证格式稳定；较低温度减少标题、表格和代码块的
         # 随机变体，内容差异由用户需求和实时数据决定。
         self.temperature = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+        # 正文流的业务级时限。网关可能在 HTTP 连接正常时长时间不返回任何
+        # token，单靠 httpx read timeout 会让页面看似无限等待。
+        self.first_token_timeout = max(
+            5.0, float(os.getenv("LLM_FIRST_TOKEN_TIMEOUT", "45"))
+        )
+        self.stream_timeout = max(
+            self.first_token_timeout + 5.0,
+            float(os.getenv("LLM_STREAM_TIMEOUT", "75")),
+        )
+        # 专业版上下文和输出明显更长，使用独立时限；期间仍会每 10 秒推送进度。
+        self.professional_first_token_timeout = max(
+            self.first_token_timeout,
+            float(os.getenv("LLM_PRO_FIRST_TOKEN_TIMEOUT", "75")),
+        )
+        self.professional_stream_timeout = max(
+            self.professional_first_token_timeout + 5.0,
+            float(os.getenv("LLM_PRO_STREAM_TIMEOUT", "180")),
+        )
 
     @property
     def is_configured(self) -> bool:

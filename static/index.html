@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>AI 旅行攻略生成器</title>
-<link rel="stylesheet" href="/static/style.css?v=20260712-mobile-result-header">
+<link rel="stylesheet" href="/static/style.css?v=20260801-generation-recovery-mobile-result-header">
 </head>
 <body>
 
@@ -43,11 +43,27 @@
           placeholder="例如：我从武汉出发，想去西藏游玩18天，2个人，喜欢自然风光..."
           maxlength="2000"
         ></textarea>
+        <div class="generation-mode-selector" aria-label="攻略生成模式">
+          <div class="mode-choice-row">
+            <button type="button" class="mode-option active" data-generation-mode="standard">标准版</button>
+            <button
+              type="button"
+              class="mode-switch"
+              id="generation-mode-switch"
+              role="switch"
+              aria-checked="false"
+              aria-label="切换为专业版"
+            ><span class="mode-switch-knob" aria-hidden="true"></span></button>
+            <button type="button" class="mode-option" data-generation-mode="professional">专业版</button>
+          </div>
+          <p class="mode-description" id="mode-description">更快生成，保留核心行程、预算和避坑信息</p>
+        </div>
         <div class="input-footer">
           <span class="char-count"><span id="char-count">0</span>/2000</span>
           <button class="btn btn-primary" id="btn-generate">生成攻略 &#x2192;</button>
         </div>
       </div>
+      <p class="generation-error" id="generation-error" role="alert" style="display:none"></p>
 
       <div class="quick-tags">
         <span class="tag-label">快速体验</span>
@@ -67,7 +83,7 @@
         <div class="pulse-dot"></div>
         <div class="generating-title">
           <h3>AI 正在为您规划行程...</h3>
-          <span class="generating-note">生成报告将耗时2分钟左右</span>
+          <span class="generating-note" id="generating-note">标准版通常可更快生成</span>
         </div>
         <button class="btn btn-sm btn-ghost" id="btn-cancel">取消</button>
       </div>
@@ -131,6 +147,6 @@
 </footer>
 
 <script src="/static/background.js?v=20260712-mobile-random-bg"></script>
-<script src="/static/app.js?v=20260715-stream-reset"></script>
+<script src="/static/app.js?v=20260801-report-duration-save-generation-recovery"></script>
 </body>
 </html>

@@ -226,9 +226,110 @@ SYSTEM_PROMPT = """你是一位顶级的 AI 旅行规划师，名为「路小仙
 """
 
 
-def build_user_message(query: str, travel_data: dict = None) -> str:
+STANDARD_SYSTEM_PROMPT = """你是一位专业、务实的 AI 旅行规划师「路小仙（Leo）」。
+请生成一份精炼但可以直接执行的标准版旅行攻略。优先给出路线、时间、价格、预约和风险，避免重复解释与长篇背景介绍。
+
+## 通用规则
+- 直接以 `# ` 一级标题开始，不写寒暄或开场白
+- 表格优先，时间精确到 30 分钟，价格给出区间
+- 实时数据可以直接引用；AI 推算内容注明「供参考，以官方为准」
+- 不编造实时价格、营业时间和开放状态
+- 当前年份为 2026 年，不使用过时的防疫、核酸、健康码等信息
+- 标题、路线总览、分日行程的天数和顺序必须一致
+- 自驾单日不得超过 800km 或 10h；高海拔路段不得超过 500km 或 8h
+
+## 输出结构
+1. `# 🗺️ [目的地] [天数]日行程 · 为[人数]人定制`
+2. 紧接一段关键统计、路线总览和最重要的 1-3 条提示
+3. `## 🌤️ 天气与穿搭`：3-5 条
+4. `## 🚄 交通建议`：用一张精简表格覆盖去程、返程和市内交通
+5. `## 🏨 住宿建议`：推荐 2-3 个区域或档位
+6. `## 📅 分日行程`：每天独立成节，每天 3-4 个核心时段，包含餐饮/住宿和本日预算；自驾标题标注里程与时长
+7. `## 💰 总预算`：列出大交通、住宿、餐饮、门票和市内交通
+8. `## 🚨 必做预约 & 证件清单`：4-6 条，写清渠道、提前天数和所需证件
+9. `## ⚠️ 避坑提示`：4-6 条可执行事项
+10. `## 🎒 行前物品清单`：用两列表格列证件、衣物、药品、防护、电子用品，每类只保留关键物品和数量
+11. `## 🌳 行程知识图谱`：用代码块按 Day 逐行列出主题和关键节点，覆盖全部天数，每天只写一行
+12. 末尾保留一段简短免责声明
+
+出境游补充签证、货币、通讯、时差和紧急联系方式，但不要生成中国大陆自驾里程。物品清单和知识图谱必须生成但保持精简；不要附加延伸提问，不要为了显得详细而重复同一信息。
+"""
+
+
+GENERATION_MODES = {"standard", "professional"}
+
+# 仅限制注入模型的副本；携程和其他数据源的 SQLite 原始缓存保持完整。
+_SOURCE_LIMITS = {
+    "standard": {
+        "transport": 1800,
+        "hotels": 1100,
+        "attractions": 1100,
+        "tips": 700,
+        "train": 600,
+        "amap": 700,
+    },
+    "professional": {
+        "transport": 4000,
+        "hotels": 2000,
+        "attractions": 2000,
+        "tips": 1500,
+        "train": 1200,
+        "amap": 1300,
+    },
+}
+
+
+def normalize_generation_mode(mode: str) -> str:
+    normalized = (mode or "").strip().lower()
+    if normalized not in GENERATION_MODES:
+        raise ValueError("生成模式仅支持 standard 或 professional")
+    return normalized
+
+
+def get_system_prompt(mode: str) -> str:
+    return STANDARD_SYSTEM_PROMPT if normalize_generation_mode(mode) == "standard" else SYSTEM_PROMPT
+
+
+def report_max_tokens(mode: str, configured_max: int) -> int:
+    if normalize_generation_mode(mode) == "standard":
+        # 这是输出上限而非目标长度；给足余量可避免 6 天以上行程在 Day 中途截断。
+        return min(configured_max, 10000)
+    return configured_max
+
+
+def _truncate_markdown(text: str, limit: int) -> str:
+    """按段落或完整行裁剪，避免在 Markdown 表格单元格中间截断。"""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    suffix = "\n\n（实时数据较长，已保留前述关键部分）"
+    boundary = max(1, limit - len(suffix))
+    prefix = text[:boundary]
+    paragraph_end = prefix.rfind("\n\n")
+    line_end = prefix.rfind("\n")
+    cut = paragraph_end if paragraph_end >= boundary // 2 else line_end
+    if cut < boundary // 2:
+        cut = boundary
+    return prefix[:cut].rstrip() + suffix
+
+
+def compact_travel_data(travel_data: dict | None, mode: str) -> dict:
+    """返回用于提示词的限长副本，不修改调用方字典或原始缓存。"""
+    compacted = dict(travel_data or {})
+    limits = _SOURCE_LIMITS[normalize_generation_mode(mode)]
+    for key, limit in limits.items():
+        compacted[key] = _truncate_markdown(str(compacted.get(key) or ""), limit)
+    return compacted
+
+
+def build_user_message(
+    query: str,
+    travel_data: dict = None,
+    mode: str = "professional",
+) -> str:
     """构建 User Message，注入可用的外部实时/准实时数据。"""
-    travel_data = travel_data or {}
+    mode = normalize_generation_mode(mode)
+    travel_data = compact_travel_data(travel_data, mode)
 
     route_plan = travel_data.get("route_plan", "")
     route_overview = travel_data.get("route_overview", "")
@@ -290,9 +391,17 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
         if day_scaffold else ""
     )
 
-    return f"""用户旅行需求：{query}{route_block}{data_context}
-
-请严格按照 System Prompt 的输出规范，生成一份极其详尽的旅游攻略：
+    if mode == "standard":
+        generation_rules = f"""请按照标准版输出规范生成攻略：
+- 优先保证路线、逐日安排、预算、预约和风险可直接执行
+- 实时数据只引用最有价值的价格、酒店名和预约规则，不重复堆砌
+- 每一天独立成节，安排 3-4 个核心时段并给出本日预算
+- 自驾行程标题标注当日里程和驾驶时长{scaffold_reminder}
+- 行前物品清单必须覆盖证件、衣物、药品、防护、电子用品
+- 行程知识图谱必须覆盖每个 Day，每天只写一行
+- 控制篇幅，不生成延伸问题"""
+    else:
+        generation_rules = f"""请严格按照 System Prompt 的输出规范，生成一份极其详尽的旅游攻略：
 - 携程实时数据中的具体价格、酒店名、门票规则直接引用
 - 每项花费都算清楚：人数 × 单价 = 合计
 - 避坑提示每条都要有具体数字，不能泛泛而谈
@@ -300,3 +409,7 @@ def build_user_message(query: str, travel_data: dict = None) -> str:
 - 分日行程中，每一天必须单独成节（不允许合并成"Day 5-6"）
 - 每天必须包含至少 4-5 行具体时段安排，自驾行程标题必须标注当日里程和驾驶时长{scaffold_reminder}
 - 10 个板块必须全部输出"""
+
+    return f"""用户旅行需求：{query}{route_block}{data_context}
+
+{generation_rules}"""
