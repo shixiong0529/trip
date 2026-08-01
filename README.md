@@ -103,6 +103,8 @@ apt install -y libpango-1.0-0 libpangoft2-1.0-0 libcairo2 libgobject-2.0-0 libgd
 
 服务器更新：
 
+阿里云服务器：
+
 ```bash
 cd /opt/trip
 git pull origin master
@@ -112,6 +114,19 @@ systemctl restart trip
 sleep 5
 systemctl status trip --no-pager | head -30
 curl https://trip.moyu.in/api/health
+```
+
+AWS 服务器：
+
+```bash
+cd /var/www/trip
+git pull origin master
+source .venv/bin/activate
+pip install -r requirements.txt
+systemctl restart trip
+sleep 5
+systemctl status trip --no-pager | head -30
+curl https://xiaoxian.app/api/health
 ```
 
 ## API
