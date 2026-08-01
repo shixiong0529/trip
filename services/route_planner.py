@@ -43,6 +43,7 @@ _amap_lock = asyncio.Lock()
 # 直接复用路线骨架与日程脚手架，Phase 1 的规划耗时归零
 _PLAN_CACHE_TTL = int(os.getenv("ROUTE_PLAN_CACHE_TTL", "7200"))
 _PLAN_CACHE_MAX = 32
+_PLANNER_CACHE_VERSION = "safe-long-leg-v1"
 _route_cache: dict[str, tuple[float, Any]] = {}
 _dayplan_cache: dict[str, tuple[float, Any]] = {}
 
@@ -126,6 +127,11 @@ _BRUTE_FORCE_LIMIT = 8
 # 攻略中给出中途过夜拆分建议
 _LONG_LEG_KM = 500
 _LONG_LEG_HOURS = 6
+
+# 与 prompts.py 的“安全驾驶硬约束”保持一致。超过任一上限的单段必须在
+# 进入报告模型前拆成多个真实 Day；不能只在正文里写一句“建议拆分”。
+_MAX_DAILY_DRIVE_KM = 800
+_MAX_DAILY_DRIVE_HOURS = 10
 
 # 相邻途经点驾车距离低于此值即合并为一站（同一片区顺访，不设独立转移日）
 _MIN_LEG_KM = 15
@@ -236,14 +242,15 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
     notify = _make_notify(on_progress)
 
     normalized_query = _normalize_query_for_cache(query)
-    cached = _cache_get(_route_cache, normalized_query)
+    route_cache_key = f"{_PLANNER_CACHE_VERSION}\n{normalized_query}"
+    cached = _cache_get(_route_cache, route_cache_key)
     if cached is not None:
         notify("同一需求近期已规划过，直接复用路线骨架...")
         return cached
-    persistent = await _load_persistent_cache("route", normalized_query)
+    persistent = await _load_persistent_cache("route", route_cache_key)
     if isinstance(persistent, dict) and "status" in persistent:
         result = (persistent.get("route"), persistent["status"])
-        _cache_put(_route_cache, normalized_query, result)
+        _cache_put(_route_cache, route_cache_key, result)
         notify("已从持久化缓存复用路线骨架...")
         return result
 
@@ -265,9 +272,9 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
         # 单目的地不存在排序问题，交给既有的高德参考数据即可
         logger.info("路线规划不适用（单目的地），交给常规流程")
         result = (None, "not_applicable")
-        _cache_put(_route_cache, normalized_query, result)
+        _cache_put(_route_cache, route_cache_key, result)
         await _save_persistent_cache(
-            "route", normalized_query, {"route": None, "status": "not_applicable"}
+            "route", route_cache_key, {"route": None, "status": "not_applicable"}
         )
         return result
     if not origin:
@@ -285,9 +292,9 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
             if attempt > 1:
                 logger.info("地图管线重试成功")
             result = (route, "ok")
-            _cache_put(_route_cache, normalized_query, result)
+            _cache_put(_route_cache, route_cache_key, result)
             await _save_persistent_cache(
-                "route", normalized_query, {"route": route, "status": "ok"}
+                "route", route_cache_key, {"route": route, "status": "ok"}
             )
             return result
         if attempt == 1:
@@ -374,13 +381,23 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
             for a, b in zip(seq, seq[1:])
         ]
 
-        # 长途驾驶段（在安全上限内但很累）标注中途落脚点：
-        # 取该段直线中点逆地理编码到城市，供攻略给出"拆一晚"建议
+        # 长途驾驶段标注沿途落脚点。超过 800km/10h 的段会在
+        # build_day_plan 中强制拆成多个 Day，所以这里按实际驾车线路等距
+        # 取足够多的城市；较短但疲劳的段仍保留一个拆分建议点。
         for leg, (a, b) in zip(legs, zip(seq, seq[1:])):
             if leg["km"] > _LONG_LEG_KM or (leg["hours"] or 0) > _LONG_LEG_HOURS:
                 ca, cb = located_coords[a], located_coords[b]
-                mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
-                leg["split_hint"] = await _regeo_city(client, key, mid)
+                required_days = _required_drive_days(leg)
+                if required_days > 1:
+                    split_points = await _find_split_stop_names(
+                        client, key, ca, cb, required_days - 1,
+                    )
+                    leg["split_points"] = split_points
+                    if split_points:
+                        leg["split_hint"] = split_points[len(split_points) // 2]
+                else:
+                    mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
+                    leg["split_hint"] = await _regeo_city(client, key, mid)
 
     markdown = _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts)
     if origin_inferred:
@@ -510,6 +527,95 @@ def _haversine(a: tuple[float, float], b: tuple[float, float]) -> float:
         + math.cos(lat1) * math.cos(lat2) * math.sin((lng2 - lng1) / 2) ** 2
     )
     return 6371.0 * 2 * math.asin(math.sqrt(h))
+
+
+def _required_drive_days(leg: dict[str, Any]) -> int:
+    """按单日 800km/10h 双上限计算一段路最少需要几天。"""
+    km_days = math.ceil(max(0.0, float(leg.get("km") or 0)) / _MAX_DAILY_DRIVE_KM)
+    hours = leg.get("hours")
+    hour_days = (
+        math.ceil(max(0.0, float(hours)) / _MAX_DAILY_DRIVE_HOURS)
+        if hours is not None else 1
+    )
+    return max(1, km_days, hour_days)
+
+
+async def _driving_polyline(
+    client: httpx.AsyncClient,
+    key: str,
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+) -> list[tuple[float, float]]:
+    """读取真实驾车线路折线；接口失败时返回空列表，由调用方退回直线采样。"""
+    data = await _amap_paced(lambda: _request(client, key, "/direction/driving", {
+        "origin": f"{origin[0]:.6f},{origin[1]:.6f}",
+        "destination": f"{destination[0]:.6f},{destination[1]:.6f}",
+        "strategy": 10,
+        "extensions": "all",
+    }))
+    paths = ((data or {}).get("route") or {}).get("paths") or []
+    if not paths:
+        return []
+    points = [origin]
+    for step in paths[0].get("steps") or []:
+        for raw in (step.get("polyline") or "").split(";"):
+            coord = _parse_location(raw)
+            if coord and coord != points[-1]:
+                points.append(coord)
+    if points[-1] != destination:
+        points.append(destination)
+    return points
+
+
+def _sample_path(
+    points: list[tuple[float, float]], split_count: int,
+) -> list[tuple[float, float]]:
+    """按累计线路长度等距取中途点，避免用经纬度中点落到偏离公路的位置。"""
+    if split_count <= 0 or len(points) < 2:
+        return []
+    cumulative = [0.0]
+    for a, b in zip(points, points[1:]):
+        cumulative.append(cumulative[-1] + _haversine(a, b))
+    total = cumulative[-1]
+    if total <= 0:
+        return []
+    sampled = []
+    for index in range(1, split_count + 1):
+        target = total * index / (split_count + 1)
+        segment = next(
+            (i for i in range(1, len(cumulative)) if cumulative[i] >= target),
+            len(cumulative) - 1,
+        )
+        before, after = cumulative[segment - 1], cumulative[segment]
+        ratio = (target - before) / (after - before) if after > before else 0.0
+        a, b = points[segment - 1], points[segment]
+        sampled.append((a[0] + (b[0] - a[0]) * ratio, a[1] + (b[1] - a[1]) * ratio))
+    return sampled
+
+
+async def _find_split_stop_names(
+    client: httpx.AsyncClient,
+    key: str,
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+    split_count: int,
+) -> list[str]:
+    """返回长途段每晚的具体沿途城市，数量始终与所需中途夜数一致。"""
+    points = await _driving_polyline(client, key, origin, destination)
+    if not points:
+        points = [origin, destination]
+    coords = _sample_path(points, split_count)
+    resolved = await asyncio.gather(*[
+        _regeo_city(client, key, coord) for coord in coords
+    ])
+    names = []
+    for index, name in enumerate(resolved, 1):
+        if not name:
+            name = f"沿途第{index}晚安全落脚点（出发前按导航复核）"
+        elif name in names:
+            name = f"{name}附近（第{index}晚）"
+        names.append(name)
+    return names
 
 
 def _route_cost(dist: list[list[float]], order: list[int], round_trip: bool) -> float:
@@ -653,10 +759,18 @@ def _format_skeleton(
         )
     for leg in legs:
         if leg.get("split_hint"):
-            lines.append(
-                f"⚠️ {leg['from']} → {leg['to']} 为长途驾驶段（约 {leg['km']:.0f}km），"
-                f"攻略须建议可在 {leg['split_hint']} 一带中途过夜拆分"
-            )
+            required_days = _required_drive_days(leg)
+            if required_days > 1:
+                stops = "、".join(leg.get("split_points") or [leg["split_hint"]])
+                lines.append(
+                    f"⚠️ {leg['from']} → {leg['to']} 超过单日 800km/10h 上限，"
+                    f"必须拆为至少 {required_days} 天并逐日写具体行程；建议过夜点：{stops}"
+                )
+            else:
+                lines.append(
+                    f"⚠️ {leg['from']} → {leg['to']} 为长途驾驶段（约 {leg['km']:.0f}km），"
+                    f"攻略须建议可在 {leg['split_hint']} 一带中途过夜拆分"
+                )
     for alert in alerts or []:
         lines.append(
             f"⚠️ 高德当前标注「{alert['stop']}」状态为「{alert['status']}」，"
@@ -696,6 +810,9 @@ def _merge_legs_to_budget(legs: list[dict[str, Any]], budget: int) -> list[dict[
     while len(merged) > budget:
         best_i, best_km = None, float("inf")
         for i in range(len(merged) - 1):
+            # 安全拆分产生的边界是强制过夜点，不能为了凑用户天数又合并回去。
+            if merged[i].get("long_leg_group") or merged[i + 1].get("long_leg_group"):
+                continue
             km, hours = combined(merged[i], merged[i + 1])
             if km > _MERGE_MAX_KM or (hours or 0) > _MERGE_MAX_HOURS:
                 continue
@@ -716,6 +833,53 @@ def _merge_legs_to_budget(legs: list[dict[str, Any]], budget: int) -> list[dict[
             "split_hint": b.get("split_hint") or a.get("split_hint"),
         }]
     return merged
+
+
+def _split_total(total: Any, parts: int) -> list[Optional[float]]:
+    if total is None:
+        return [None] * parts
+    value = float(total)
+    each = value / parts
+    return [each] * (parts - 1) + [value - each * (parts - 1)]
+
+
+def _expand_unsafe_legs(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把超过 800km/10h 的单段展开成多个带具体过夜点的转移日。"""
+    expanded = []
+    for group_index, leg in enumerate(legs, 1):
+        required_days = _required_drive_days(leg)
+        if required_days == 1:
+            expanded.append(dict(leg, via=list(leg.get("via") or [])))
+            continue
+
+        points = list(leg.get("split_points") or [])[:required_days - 1]
+        while len(points) < required_days - 1:
+            number = len(points) + 1
+            hint = leg.get("split_hint")
+            points.append(
+                f"{hint}附近（第{number}晚，出发前按导航复核）"
+                if hint else f"沿途第{number}晚安全落脚点（出发前按导航复核）"
+            )
+        nodes = [leg["from"], *points, leg["to"]]
+        kms = _split_total(leg.get("km"), required_days)
+        hours = _split_total(leg.get("hours"), required_days)
+        group_id = f"long-{group_index}"
+        for index, (start, end) in enumerate(zip(nodes, nodes[1:]), 1):
+            expanded.append({
+                "from": start,
+                "to": end,
+                "via": [],
+                "km": kms[index - 1],
+                "hours": hours[index - 1],
+                "measured": leg.get("measured", False),
+                "is_return": bool(leg.get("is_return") and index == required_days),
+                "is_safety_stop": index < required_days,
+                "long_leg_group": group_id,
+                "journey_day": index,
+                "journey_days": required_days,
+                "final_destination": leg["to"],
+            })
+    return expanded
 
 
 def _fit_stays_to_budget(stay_days: list[int], stays_total: int) -> list[int]:
@@ -770,7 +934,10 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         return None
     # 缓存键绑定 query + 骨架内容：路线缓存过期重算后骨架若有变化，
     # 旧日程缓存自动失效，不会出现路线与日程不配套
-    cache_key = _normalize_query_for_cache(query) + "\n" + route.get("markdown", "")
+    cache_key = (
+        _PLANNER_CACHE_VERSION + "\n" + _normalize_query_for_cache(query)
+        + "\n" + route.get("markdown", "")
+    )
     cached = _cache_get(_dayplan_cache, cache_key)
     if cached is not None:
         return cached
@@ -782,9 +949,12 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         return None
     days_budget = route.get("days_budget")
 
-    # 标记返程段，再按用户天数预算合并相邻短段（"一天串多点"）
+    # 标记返程段，先把超限长段强制拆成多个安全驾驶日，再按用户天数预算
+    # 合并其他相邻短段（"一天串多点"）。顺序不能反过来，否则 4000km
+    # 这种单段永远只占 Day 1。
     legs = [dict(leg, is_return=(round_trip and i == len(legs) - 1))
             for i, leg in enumerate(legs)]
+    legs = _expand_unsafe_legs(legs)
     notes = []
     if route.get("origin_inferred"):
         notes.append(
@@ -802,11 +972,15 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
                 f"说明该冲突并建议增加天数，禁止为凑天数压缩或删减途经点。"
             )
 
-    # 真实途经点（环线不含最后返程回到的出发地；合并段的 via 途经点当天顺访，不单独过夜）
-    n_stops = len(legs) - 1 if round_trip else len(legs)
-    if n_stops < 1:
+    # 只给用户真正要游玩的目的地分配深度游天数；安全拆分产生的沿途
+    # 过夜城市只住一晚，不能被模型再加 1-3 个“深度游”日。
+    stay_leg_indexes = [
+        i for i, leg in enumerate(legs)
+        if not leg.get("is_return") and not leg.get("is_safety_stop")
+    ]
+    if not stay_leg_indexes:
         return None
-    stop_names = [legs[i]["to"] for i in range(n_stops)]
+    stop_names = [legs[i]["to"] for i in stay_leg_indexes]
 
     if days_budget:
         stays_total = max(0, min(days_budget, _MAX_TOTAL_DAYS) - len(legs))
@@ -815,10 +989,11 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
                 await _allocate_stay_days(query, stop_names, llm), stays_total,
             )
         else:
-            stay_days = [0] * n_stops
+            stay_days = [0] * len(stop_names)
     else:
         stay_days = await _allocate_stay_days(query, stop_names, llm)
 
+    stays_by_leg = dict(zip(stay_leg_indexes, stay_days))
     days, d = [], 1
     for i, leg in enumerate(legs):
         days.append({
@@ -828,17 +1003,22 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
             "km": leg["km"], "hours": leg["hours"], "measured": leg["measured"],
             "is_return": leg.get("is_return", False),
             "split_hint": leg.get("split_hint"),
+            "is_safety_stop": leg.get("is_safety_stop", False),
+            "long_leg_group": leg.get("long_leg_group"),
+            "journey_day": leg.get("journey_day"),
+            "journey_days": leg.get("journey_days"),
+            "final_destination": leg.get("final_destination"),
         })
         d += 1
-        if not leg.get("is_return"):
-            for _ in range(stay_days[i]):
+        if i in stays_by_leg:
+            for _ in range(stays_by_leg[i]):
                 days.append({"day": d, "kind": "stay", "at": leg["to"]})
                 d += 1
 
     if budget_note:
         notes.append(budget_note)
     result = {
-        "overview": " → ".join(seq_names),
+        "overview": " → ".join([legs[0]["from"], *[leg["to"] for leg in legs]]),
         "scaffold_md": _render_scaffold(days, route.get("alerts") or [], "\n　⚠️ ".join(notes)),
         "days": days,
     }
@@ -1105,7 +1285,20 @@ def _render_scaffold(
                     f"　↳ 本日为串点日：途中依次游览 {'、'.join(day['via'])}，"
                     f"再抵达 {day['to']} 过夜；时段表须覆盖每个途经点的游览安排"
                 )
-            if day.get("split_hint"):
+            if day.get("long_leg_group"):
+                progress = f"第 {day['journey_day']}/{day['journey_days']} 天"
+                if day.get("is_safety_stop"):
+                    lines.append(
+                        f"　↳ 本日是连续长途的{progress}：必须在 {day['to']} 住宿，"
+                        f"不得写成当天直达 {day['final_destination']}；时段表写清出发、"
+                        f"每 2 小时服务区休息、午晚餐、抵达住宿等具体安排"
+                    )
+                else:
+                    lines.append(
+                        f"　↳ 本日是连续长途的{progress}并抵达 {day['final_destination']}；"
+                        f"时段表必须承接前一晚落脚城市，禁止把整段总里程重新写进本日"
+                    )
+            elif day.get("split_hint"):
                 lines.append(
                     f"　↳ 本段为全程长途驾驶日：该天提示列必须包含「每 2 小时进服务区休息」，"
                     f"并明确建议「不想赶路可在 {day['split_hint']} 一带中途过夜、行程加 1 天」"

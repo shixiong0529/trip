@@ -3,14 +3,130 @@
 import asyncio
 
 from services.route_planner import (
+    _expand_unsafe_legs,
     _match_day,
     _normalize_query_for_cache,
+    _required_drive_days,
+    _sample_path,
     _dayplan_cache,
     check_day_sequence_prefix,
     build_day_plan,
     repair_day_headings,
     validate_day_sequence,
 )
+
+
+def test_unsafe_4000km_leg_requires_multiple_real_days():
+    leg = {"km": 4035, "hours": 43.2}
+
+    assert _required_drive_days(leg) == 6
+
+
+def test_unsafe_leg_expands_to_concrete_overnight_stops_with_safe_caps():
+    legs = [{
+        "from": "西安",
+        "to": "塔什库尔干",
+        "km": 4035,
+        "hours": 43.2,
+        "measured": True,
+        "is_return": False,
+        "split_points": ["兰州", "酒泉", "哈密", "库尔勒", "喀什"],
+    }]
+
+    expanded = _expand_unsafe_legs(legs)
+
+    assert len(expanded) == 6
+    assert [(leg["from"], leg["to"]) for leg in expanded] == [
+        ("西安", "兰州"),
+        ("兰州", "酒泉"),
+        ("酒泉", "哈密"),
+        ("哈密", "库尔勒"),
+        ("库尔勒", "喀什"),
+        ("喀什", "塔什库尔干"),
+    ]
+    assert all(leg["km"] <= 800 for leg in expanded)
+    assert all(leg["hours"] <= 10 for leg in expanded)
+    assert all(leg["is_safety_stop"] for leg in expanded[:-1])
+    assert expanded[-1]["is_safety_stop"] is False
+
+
+def test_path_sampling_returns_one_ordered_point_per_overnight_stop():
+    points = [(0.0, 0.0), (2.0, 0.0), (5.0, 0.0)]
+
+    sampled = _sample_path(points, 4)
+
+    assert len(sampled) == 4
+    assert [point[0] for point in sampled] == sorted(point[0] for point in sampled)
+
+
+def test_day_plan_uses_split_days_instead_of_locking_4000km_into_day_one(isolated_db):
+    route = {
+        "seq_names": ["西安", "塔什库尔干", "喀什"],
+        "legs": [
+            {
+                "from": "西安", "to": "塔什库尔干", "km": 4035,
+                "hours": 43.2, "measured": True,
+                "split_points": ["兰州", "酒泉", "哈密", "库尔勒", "喀什"],
+            },
+            {
+                "from": "塔什库尔干", "to": "喀什", "km": 300,
+                "hours": 5, "measured": True,
+            },
+        ],
+        "round_trip": False,
+        "days_budget": 7,
+        "markdown": "unique-safe-long-leg-route",
+    }
+
+    plan = asyncio.run(build_day_plan("西安到新疆7天安全自驾", route, object()))
+
+    assert plan is not None
+    assert len(plan["days"]) == 7
+    assert plan["days"][0]["from"] == "西安"
+    assert plan["days"][0]["to"] == "兰州"
+    assert plan["days"][5]["to"] == "塔什库尔干"
+    assert "西安 → 兰州 → 酒泉 → 哈密 → 库尔勒 → 喀什 → 塔什库尔干" in plan["overview"]
+    assert "必须在 兰州 住宿" in plan["scaffold_md"]
+    assert "约 4035km" not in plan["scaffold_md"]
+
+
+def test_eighteen_day_loop_spends_real_days_on_both_extreme_legs(isolated_db):
+    middle_names = ["喀什", "库车", "巴音布鲁克", "伊宁", "乌鲁木齐", "克拉玛依", "喀纳斯", "可可托海"]
+    names = ["塔什库尔干", *middle_names]
+    legs = [{
+        "from": "西安", "to": "塔什库尔干", "km": 4035,
+        "hours": 43.2, "measured": True,
+        "split_points": ["中卫", "酒泉", "哈密", "焉耆", "柯坪"],
+    }]
+    for start, end in zip(names, middle_names):
+        legs.append({
+            "from": start, "to": end, "km": 300,
+            "hours": 5, "measured": True,
+        })
+    legs.append({
+        "from": "可可托海", "to": "西安", "km": 2788,
+        "hours": 31.5, "measured": True,
+        "split_points": ["哈密", "酒泉", "兰州"],
+    })
+    route = {
+        "seq_names": ["西安", *names, "西安"],
+        "legs": legs,
+        "round_trip": True,
+        "days_budget": 18,
+        "markdown": "exact-html-regression-safe-long-legs",
+    }
+
+    plan = asyncio.run(build_day_plan("西安出发新疆18天环线自驾", route, object()))
+
+    assert plan is not None
+    assert len(plan["days"]) == 18
+    transfers = [day for day in plan["days"] if day["kind"] == "transfer"]
+    assert all(day["km"] <= 800 for day in transfers)
+    assert all(day["hours"] <= 10 for day in transfers)
+    assert transfers[0]["to"] == "中卫"
+    assert transfers[5]["to"] == "塔什库尔干"
+    assert transfers[-4]["from"] == "可可托海"
+    assert transfers[-1]["to"] == "西安"
 
 
 def test_merged_stop_title_is_not_rejected():
