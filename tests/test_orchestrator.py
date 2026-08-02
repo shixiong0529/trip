@@ -391,6 +391,135 @@ def test_infeasible_route_is_stopped_before_report_generation(monkeypatch):
     assert "路线可行性检查未通过" in events[-1]["data"]
 
 
+@pytest.mark.parametrize("mode", ["standard", "professional"])
+def test_invalid_location_route_is_stopped_before_any_report_model(monkeypatch, mode):
+    class ReportMustNotRun:
+        async def chat_stream(self, messages):
+            raise AssertionError("地点身份冲突不能进入正文或审核模型")
+            yield
+
+    async def fake_collect(*args, **kwargs):
+        return {}
+
+    async def fake_plan(*args, **kwargs):
+        return {
+            "location_resolutions": [],
+            "location_validation_issues": [{
+                "requested": "甲州市云谷景区",
+                "reason": "同名候选的行政区或 POI 类型不匹配",
+            }],
+        }, "invalid_locations"
+
+    async def build_must_not_run(*args, **kwargs):
+        raise AssertionError("无效地点不能进入日程脚手架")
+
+    monkeypatch.setattr("services.data_collector.collect_travel_data", fake_collect)
+    monkeypatch.setattr("services.route_planner.plan_route", fake_plan)
+    monkeypatch.setattr("services.route_planner.build_day_plan", build_must_not_run)
+
+    orchestrator = TravelGuideOrchestrator(
+        "https://api.example.com/v1", "k", "m", mode=mode,
+    )
+    orchestrator.llm = ReportMustNotRun()
+    orchestrator.review_llm = ReportMustNotRun()
+
+    async def consume():
+        return [event async for event in orchestrator.generate("甲州市自然景观自驾")]
+
+    events = asyncio.run(consume())
+
+    assert events[-1]["type"] == "error"
+    assert "路线地点校验未通过" in events[-1]["data"]
+    assert "甲州市云谷景区" in events[-1]["data"]
+
+
+def test_route_audit_exception_fails_closed_before_report_model(monkeypatch):
+    class ReportMustNotRun:
+        async def chat_stream(self, messages):
+            raise AssertionError("路线门禁异常时不能降级进入正文模型")
+            yield
+
+    async def fake_collect(*args, **kwargs):
+        return {}
+
+    route = {
+        "markdown": "locked route",
+        "seq_names": ["甲地", "乙地"],
+        "legs": [{
+            "from": "甲地", "to": "乙地", "km": 100,
+            "hours": 2, "measured": True,
+        }],
+    }
+    day_plan = {
+        "overview": "甲地 → 乙地",
+        "scaffold_md": "locked days",
+        "days": [{
+            "day": 1, "kind": "transfer", "from": "甲地", "to": "乙地",
+            "km": 100, "hours": 2, "measured": True,
+        }],
+    }
+
+    async def fake_plan(*args, **kwargs):
+        return route, "ok"
+
+    async def fake_build(*args, **kwargs):
+        return day_plan
+
+    def broken_audit(*args, **kwargs):
+        raise RuntimeError("audit crashed")
+
+    monkeypatch.setattr("services.data_collector.collect_travel_data", fake_collect)
+    monkeypatch.setattr("services.route_planner.plan_route", fake_plan)
+    monkeypatch.setattr("services.route_planner.build_day_plan", fake_build)
+    monkeypatch.setattr("services.report_quality.audit_route_plan", broken_audit)
+
+    orchestrator = TravelGuideOrchestrator(
+        "https://api.example.com/v1", "k", "m", mode="standard",
+    )
+    orchestrator.llm = ReportMustNotRun()
+
+    async def consume():
+        return [event async for event in orchestrator.generate("测试自驾路线")]
+
+    events = asyncio.run(consume())
+
+    assert events[-1]["type"] == "error"
+    assert "路线安全检查异常" in events[-1]["data"]
+
+
+@pytest.mark.parametrize("mode", ["standard", "professional"])
+def test_self_drive_route_planning_failure_never_falls_back_to_free_llm_route(
+    monkeypatch, mode,
+):
+    class ReportMustNotRun:
+        async def chat_stream(self, messages):
+            raise AssertionError("自驾路线规划失败后不能进入自由排线正文模型")
+            yield
+
+    async def fake_collect(*args, **kwargs):
+        return {}
+
+    async def fake_plan(*args, **kwargs):
+        return None, "failed"
+
+    monkeypatch.setattr("services.data_collector.collect_travel_data", fake_collect)
+    monkeypatch.setattr("services.route_planner.plan_route", fake_plan)
+
+    orchestrator = TravelGuideOrchestrator(
+        "https://api.example.com/v1", "k", "m", mode=mode,
+    )
+    orchestrator.llm = ReportMustNotRun()
+    orchestrator.review_llm = ReportMustNotRun()
+
+    async def consume():
+        return [event async for event in orchestrator.generate("广西多点自驾10天")]
+
+    events = asyncio.run(consume())
+
+    assert events[-1]["type"] == "error"
+    assert "停止生成未经地图校验的报告" in events[-1]["data"]
+
+
 def test_empty_report_stream_retries_once_without_recollecting_data():
     class EmptyThenSuccessLLM:
         last_finish_reason = None

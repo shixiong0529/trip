@@ -631,6 +631,7 @@ class TravelGuideOrchestrator:
             travel_data=travel_data,
             day_plan=day_plan,
             program_issues=program_issues,
+            route=route,
         )
 
         # JSON 格式异常时仅重试一次；每次均为新的独立审稿请求。
@@ -885,6 +886,10 @@ class TravelGuideOrchestrator:
                         return None, "not_applicable", None
                     r, s = await plan_route(query, self.fast_llm, fallback_llm=self.llm, on_progress=note)
                     dp = None
+                    if s == "invalid_locations":
+                        # 永久地点身份冲突不能进入日程分配，更不能在后续降级成
+                        # 纯 LLM 排线；把结构化问题原样交给外层生成前门禁。
+                        return r, s, None
                     if r:
                         note("路线骨架已锁定，正在分配每日行程节奏...")
                         try:
@@ -949,17 +954,73 @@ class TravelGuideOrchestrator:
                 yield {"type": "error", "data": f"路线可行性检查未通过：{reason}"}
                 return
 
+            if plan_status == "invalid_locations":
+                validation = (
+                    route.get("location_validation_issues")
+                    if isinstance(route, dict)
+                    else None
+                )
+                first = validation[0] if isinstance(validation, list) and validation else {}
+                requested = str(first.get("requested") or "某个目的地")
+                reason = str(first.get("reason") or "地图结果与地点名称不一致")
+                yield {
+                    "type": "error",
+                    "data": (
+                        f"路线地点校验未通过：{requested}（{reason}）。"
+                        "程序已阻止使用错误坐标生成报告，请稍后重试或写出更明确的景点名称。"
+                    ),
+                }
+                return
+
+            if route:
+                try:
+                    from services.report_quality import audit_route_plan, decide_review_action
+
+                    route_issues = audit_route_plan(query, route, day_plan)
+                    if decide_review_action(route_issues) == "route_replan":
+                        first = next(
+                            issue for issue in route_issues
+                            if issue.suggested_action == "route_replan"
+                        )
+                        logger.error("路线生成前硬校验未通过: %s", first.diagnosis)
+                        yield {
+                            "type": "error",
+                            "data": f"路线安全检查未通过：{first.diagnosis}",
+                        }
+                        return
+                except Exception:
+                    # 路线安全门禁不能与普通实时数据一样 fail-open；否则审计
+                    # 自身出现异常时，程序反而会降级成无骨架的纯 LLM 报告。
+                    logger.exception("路线生成前硬校验异常，已停止发布")
+                    yield {
+                        "type": "error",
+                        "data": "路线安全检查异常，程序已停止生成错误报告，请稍后重试",
+                    }
+                    return
+
             if route:
                 travel_data["route_plan"] = route["markdown"]
+                if route.get("location_resolutions"):
+                    # 给正文与专业审核提供显示名和实际行政区的对应关系；不含
+                    # 密钥或完整上游响应，避免模型只看到标签而看不到定位事实。
+                    travel_data["route_location_resolutions"] = [
+                        {
+                            key: item.get(key)
+                            for key in (
+                                "requested", "resolved_name", "source", "poi_type",
+                                "province", "city", "district", "admin_match", "type_valid",
+                                "role", "user_named", "scope_provinces", "scope_match",
+                            )
+                        }
+                        for item in route["location_resolutions"]
+                        if isinstance(item, dict)
+                    ]
                 if day_plan:
                     travel_data["route_overview"] = day_plan["overview"]
                     travel_data["day_scaffold"] = day_plan["scaffold_md"]
                     yield {"type": "progress", "data": "多点路线已按地图距离、景观道路与门户约束排定，并锁定每日行程骨架..."}
                 else:
                     yield {"type": "progress", "data": "多点路线已按地图距离与路线语义约束排定..."}
-            elif plan_status == "failed":
-                # 规划失败对路线质量影响很大，必须让用户可见，而不是静默降级
-                yield {"type": "progress", "data": "⚠️ 多点路线规划未生效，本次路线顺序由 AI 自行推算，建议重新生成一次..."}
         except Exception as e:
             # 数据采集失败不影响后续流程，退化为纯 LLM 生成
             yield {"type": "progress", "data": f"实时数据查询异常（将使用AI推算）: {str(e)[:60]}"}
@@ -974,6 +1035,15 @@ class TravelGuideOrchestrator:
                 task.cancel()
             if unfinished:
                 await asyncio.gather(*unfinished, return_exceptions=True)
+
+        if intent.use_drive_planner and plan_status == "failed":
+            # 明确自驾的多点路线若地图规划失败，继续让正文模型自由排线就会
+            # 重新放出跨省误定位和大折返；此处与地点校验一样必须 fail-closed。
+            yield {
+                "type": "error",
+                "data": "自驾路线规划未完成，程序已停止生成未经地图校验的报告，请稍后重试",
+            }
+            return
 
         # ---------- Phase 2: LLM 生成 ----------
         yield {"type": "progress", "data": "AI 正在分析数据并规划行程..."}

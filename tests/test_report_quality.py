@@ -8,6 +8,7 @@ from services.report_quality import (
     ReviewIssue,
     ReviewResult,
     audit_report,
+    audit_route_plan,
     build_repair_messages,
     build_review_messages,
     decide_review_action,
@@ -437,6 +438,165 @@ def test_program_audit_requires_locked_corridor_and_via():
     assert any("库车大小龙池" in issue.diagnosis for issue in issues)
 
 
+def test_program_audit_blocks_unresolved_route_location_before_publication():
+    route = {
+        "location_validation_issues": [{
+            "requested": "甲州市云谷景区",
+            "reason": "unresolved_after_validation",
+        }],
+    }
+
+    issues = audit_report(complete_report(), route=route)
+
+    location = [issue for issue in issues if issue.category == "location_mismatch"]
+    assert len(location) == 1
+    assert location[0].severity == "critical"
+    assert location[0].suggested_action == "route_replan"
+    assert decide_review_action(issues) == "route_replan"
+
+
+def test_program_audit_blocks_admin_or_poi_type_mismatch_in_locked_route():
+    route = {
+        "location_resolutions": [{
+            "requested": "甲州市云谷景区",
+            "resolved_name": "云谷",
+            "province": "乙省",
+            "city": "乙州市",
+            "district": "中心区",
+            "poi_type": "餐饮服务;中餐厅",
+            "admin_match": False,
+            "type_valid": False,
+        }],
+    }
+
+    issues = audit_report(complete_report(), route=route)
+
+    location = next(issue for issue in issues if issue.category == "location_mismatch")
+    assert "行政区与请求名称不一致" in location.diagnosis
+    assert "餐饮服务" in location.diagnosis
+    assert location.suggested_action == "route_replan"
+
+
+def test_program_audit_accepts_verified_route_location_metadata():
+    route = {
+        "location_resolutions": [{
+            "requested": "甲州市云谷景区",
+            "resolved_name": "云谷风景区",
+            "province": "甲省",
+            "city": "甲州市",
+            "district": "山水区",
+            "poi_type": "风景名胜;风景名胜",
+            "admin_match": True,
+            "type_valid": True,
+        }],
+        "location_validation_issues": [],
+    }
+
+    issues = audit_report(complete_report(), route=route)
+
+    assert not any(issue.category == "location_mismatch" for issue in issues)
+
+
+def test_route_preflight_blocks_invalid_location_without_report_content():
+    route = {
+        "location_validation_issues": [{
+            "requested": "甲州市云谷景区",
+            "reason": "poi_type_mismatch",
+        }],
+    }
+
+    issues = audit_route_plan("甲州市自然景观自驾", route)
+
+    assert decide_review_action(issues) == "route_replan"
+    assert issues[0].category == "location_mismatch"
+
+
+def test_route_preflight_rejects_unsafe_day_before_report_generation():
+    day_plan = {
+        "days": [{
+            "day": 3,
+            "kind": "transfer",
+            "from": "甲地",
+            "to": "乙地",
+            "km": 920,
+            "hours": 11.5,
+        }],
+    }
+
+    issues = audit_route_plan("自驾3天", {}, day_plan)
+
+    assert decide_review_action(issues) == "route_replan"
+    assert issues[0].category == "driving_feasibility"
+
+
+def test_route_preflight_rejects_recommended_stop_outside_target_scope():
+    route = {
+        "schema_version": "route-semantics-v6",
+        "scope_provinces": ["广西"],
+        "location_validation_issues": [],
+        "location_resolutions": [{
+            "requested": "荆州市洪湖湿地",
+            "resolved_name": "洪湖湿地",
+            "province": "湖北省",
+            "city": "荆州市",
+            "district": "洪湖市",
+            "poi_type": "风景名胜;风景名胜",
+            "admin_match": True,
+            "type_valid": True,
+            "role": "destination",
+            # 即使上游错误写成 True，preflight 也必须用原始 query 独立复核。
+            "user_named": True,
+            "scope_match": False,
+        }],
+    }
+
+    issues = audit_route_plan("我从永州出发自驾游广西10天", route)
+
+    assert decide_review_action(issues) == "route_replan"
+    assert any("目标省域" in issue.diagnosis for issue in issues)
+    final_issues = audit_report(complete_report(), route=route)
+    assert any("目标省域" in issue.diagnosis for issue in final_issues)
+
+
+def test_route_preflight_rejects_unverified_long_leg_segments():
+    route = {
+        "legs": [{
+            "from": "甲地", "to": "乙地", "km": 1200, "hours": 14,
+            "split_verified": False,
+            "split_segments": [
+                {"from": "甲地", "to": "中途市", "km": 600,
+                 "hours": None, "measured": False},
+                {"from": "中途市", "to": "乙地", "km": 600,
+                 "hours": 7, "measured": True},
+            ],
+        }],
+    }
+
+    issues = audit_route_plan("自驾3天", route)
+
+    assert decide_review_action(issues) == "route_replan"
+    assert any("逐段实测" in issue.diagnosis for issue in issues)
+
+
+def test_route_preflight_accepts_verified_safe_long_leg_segments():
+    route = {
+        "legs": [{
+            "from": "甲地", "to": "乙地", "km": 1200, "hours": 14,
+            "split_verified": True,
+            "split_segments": [
+                {"from": "甲地", "to": "中途市", "km": 430,
+                 "hours": 5.2, "measured": True},
+                {"from": "中途市", "to": "乙地", "km": 770,
+                 "hours": 8.8, "measured": True},
+            ],
+        }],
+    }
+
+    issues = audit_route_plan("自驾3天", route)
+
+    assert not any(issue.category == "driving_feasibility" for issue in issues)
+
+
 def test_decision_helpers_keep_route_replan_separate_from_rewrite():
     rewrite = ReviewIssue(
         id="x", severity="major", category="missing_section",
@@ -488,6 +648,7 @@ def test_message_builders_keep_audit_and_repair_as_separate_tasks():
         {"tips": "以官方实时公告为准"},
         DAY_PLAN,
         [issue],
+        route=ROUTE,
     )
     repair = build_repair_messages(
         "巴音布鲁克2天",
@@ -502,8 +663,11 @@ def test_message_builders_keep_audit_and_repair_as_separate_tasks():
     assert "evidence 必须是报告原文" in review[0]["content"]
     assert "Day 标题中出现的途经点已经算明确落实" in review[0]["content"]
     assert "景点安排 2-3 小时本身不构成 major" in review[0]["content"]
-    assert "程序预检为空" in review[0]["content"]
+    assert "程序预检为空只表示正文结构" in review[0]["content"]
+    assert "不代表骨架的地图定位必然正确" in review[0]["content"]
     assert "应报告 route_consistency 并使用 rewrite" in review[0]["content"]
+    assert "程序路线与地图定位摘要" in review[1]["content"]
+    assert "和静县巴音布鲁克草原" in review[1]["content"]
     assert '"id": "P001"' in review[1]["content"]
     assert "输出修复后的完整终稿" in repair[1]["content"]
     assert "禁止擅自修改" in repair[0]["content"]

@@ -2,15 +2,23 @@
 
 import asyncio
 
+import pytest
+
 from services.route_planner import (
     _apply_ordered_chains,
     _collapse_near_stops,
+    _driving_matrix,
+    _extract_query_region_hints,
     _expand_unsafe_legs,
+    _geocode_all,
     _insert_gateway_excursions,
     _match_day,
     _normalize_query_for_cache,
     _poi_core_name,
     _poi_match_score,
+    _query_directly_mentions_location,
+    _requested_admin_units,
+    _split_admin_prefix,
     _plan_geo,
     _required_drive_days,
     _sample_path,
@@ -57,6 +65,79 @@ def test_unsafe_leg_expands_to_concrete_overnight_stops_with_safe_caps():
     assert expanded[-1]["is_safety_stop"] is False
 
 
+def test_unsafe_leg_uses_real_split_segment_metrics_instead_of_equal_division():
+    legs = [{
+        "from": "甲地",
+        "to": "乙地",
+        "km": 1200,
+        "hours": 14,
+        "measured": True,
+        "split_verified": True,
+        "split_points": ["中途市"],
+        "split_segments": [
+            {
+                "from": "甲地", "to": "中途市", "km": 430,
+                "hours": 5.2, "measured": True,
+            },
+            {
+                "from": "中途市", "to": "乙地", "km": 770,
+                "hours": 8.8, "measured": True,
+            },
+        ],
+    }]
+
+    expanded = _expand_unsafe_legs(legs)
+
+    assert [leg["km"] for leg in expanded] == [430, 770]
+    assert [leg["hours"] for leg in expanded] == [5.2, 8.8]
+    assert all(leg["measured"] for leg in expanded)
+    assert not any(leg["estimated_split"] for leg in expanded)
+
+
+def test_unsafe_leg_equal_division_fallback_is_not_labeled_as_measured():
+    expanded = _expand_unsafe_legs([{
+        "from": "甲地", "to": "乙地", "km": 1200, "hours": 14,
+        "measured": True, "split_points": ["中途市"],
+    }])
+
+    assert [leg["km"] for leg in expanded] == [600, 600]
+    assert all(leg["measured"] is False for leg in expanded)
+    assert all(leg["estimated_split"] is True for leg in expanded)
+
+
+def test_driving_matrix_rejects_distance_shorter_than_geodesic(monkeypatch):
+    from services import route_planner
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "status": "1",
+                "results": [
+                    {"origin_id": "1", "distance": "1000", "duration": "60"},
+                    {"origin_id": "2", "distance": "1000", "duration": "60"},
+                ],
+            }
+
+    class FakeClient:
+        async def get(self, *args, **kwargs):
+            return FakeResponse()
+
+    async def immediate(call):
+        return await call()
+
+    monkeypatch.setattr(route_planner, "_amap_paced", immediate)
+    distance, duration, measured = asyncio.run(_driving_matrix(
+        FakeClient(), "test-key", [(0.0, 0.0), (10.0, 0.0)],
+    ))
+
+    assert distance[0][1] > 1000
+    assert duration[0][1] is None
+    assert measured[0][1] is False
+
+
 def test_path_sampling_returns_one_ordered_point_per_overnight_stop():
     points = [(0.0, 0.0), (2.0, 0.0), (5.0, 0.0)]
 
@@ -95,6 +176,7 @@ def test_day_plan_uses_split_days_instead_of_locking_4000km_into_day_one(isolate
     assert "西安 → 兰州 → 酒泉 → 哈密 → 库尔勒 → 喀什 → 塔什库尔干" in plan["overview"]
     assert "必须在 兰州 住宿" in plan["scaffold_md"]
     assert "约 4035km" not in plan["scaffold_md"]
+    assert "分段估算" in plan["scaffold_md"]
 
 
 def test_eighteen_day_loop_spends_real_days_on_both_extreme_legs(isolated_db):
@@ -291,6 +373,44 @@ def test_fast_extraction_failure_retries_with_pro_model(monkeypatch, isolated_db
     ]
 
 
+def test_permanent_location_validation_error_has_distinct_status(monkeypatch, isolated_db):
+    from services import route_planner
+
+    async def fake_extract(query, llm, timeout_seconds):
+        return {
+            "origin": "甲州市",
+            "stops": ["甲州市青云山", "甲州市白云湖"],
+            "round_trip": True,
+        }
+
+    calls = 0
+
+    async def fake_geo(query, extracted, notify):
+        nonlocal calls
+        calls += 1
+        raise route_planner.RouteLocationValidationError([{
+            "requested": "甲州市青云山",
+            "reason": "同名 POI 行政区或类型不符",
+        }])
+
+    route_planner._route_cache.clear()
+    monkeypatch.setenv("AMAP_WEB_SERVICE_KEY", "test-key")
+    monkeypatch.setattr(route_planner, "_extract_stops", fake_extract)
+    monkeypatch.setattr(route_planner, "_plan_geo", fake_geo)
+
+    route, status = asyncio.run(route_planner.plan_route(
+        "唯一的甲州市自驾定位校验测试", object()
+    ))
+
+    assert status == "invalid_locations"
+    assert calls == 1
+    assert route["schema_version"] == "route-semantics-v6"
+    assert route["location_validation_issues"] == [{
+        "requested": "甲州市青云山",
+        "reason": "同名 POI 行政区或类型不符",
+    }]
+
+
 def test_route_planner_skips_outbound_before_calling_llm(monkeypatch):
     from services import route_planner
 
@@ -309,18 +429,226 @@ def test_route_planner_skips_outbound_before_calling_llm(monkeypatch):
 
 
 def test_poi_candidate_scoring_rejects_wrong_business_and_tianchi_road():
-    wrong_bayan = {"name": "携程度假农庄(那拉提河谷草原店)"}
-    right_bayan = {"name": "巴音布鲁克大草原"}
-    wrong_tianchi = {"name": "天池路"}
-    right_tianchi = {"name": "天山天池风景区"}
+    wrong_bayan = {
+        "name": "携程度假农庄(那拉提河谷草原店)",
+        "type": "住宿服务;住宿服务相关;住宿服务相关",
+        "pname": "新疆维吾尔自治区", "cityname": "伊犁哈萨克自治州", "adname": "新源县",
+    }
+    right_bayan = {
+        "name": "巴音布鲁克大草原", "type": "风景名胜;风景名胜;国家级景点",
+        "pname": "新疆维吾尔自治区", "cityname": "巴音郭楞蒙古自治州", "adname": "和静县",
+    }
+    wrong_tianchi = {
+        "name": "天池路", "type": "地名地址信息;交通地名;道路名",
+        "pname": "新疆维吾尔自治区", "cityname": "乌鲁木齐市", "adname": "新市区",
+    }
+    right_tianchi = {
+        "name": "天山天池风景区", "type": "风景名胜;风景名胜;国家级景点",
+        "pname": "新疆维吾尔自治区", "cityname": "昌吉回族自治州", "adname": "阜康市",
+    }
 
-    assert _poi_core_name("新源县巴音布鲁克草原") == "巴音布鲁克草原"
-    assert _poi_match_score("新源县巴音布鲁克草原", right_bayan) > _poi_match_score(
-        "新源县巴音布鲁克草原", wrong_bayan
+    assert _poi_core_name("和静县巴音布鲁克草原") == "巴音布鲁克草原"
+    assert _poi_match_score("和静县巴音布鲁克草原", right_bayan) > _poi_match_score(
+        "和静县巴音布鲁克草原", wrong_bayan
     )
-    assert _poi_match_score("乌鲁木齐市天山天池", right_tianchi) > _poi_match_score(
-        "乌鲁木齐市天山天池", wrong_tianchi
+    assert _poi_match_score("阜康市天山天池", right_tianchi) > _poi_match_score(
+        "阜康市天山天池", wrong_tianchi
     )
+    assert _poi_match_score("阜康市天山天池", wrong_tianchi) == float("-inf")
+
+
+def test_admin_parser_does_not_swallow_scenic_area_suffixes():
+    cases = {
+        "黄山市黄山风景区": (("黄山市",), "黄山风景区"),
+        "河池市小三峡景区": (("河池市",), "小三峡景区"),
+        "桂林市漓江景区": (("桂林市",), "漓江景区"),
+        "上海迪士尼度假区": (("上海",), "迪士尼度假区"),
+    }
+
+    for requested, expected in cases.items():
+        assert _split_admin_prefix(requested) == expected
+        assert _requested_admin_units(requested) == expected[0]
+        assert _poi_core_name(requested) == expected[1]
+
+    assert _split_admin_prefix("北京路步行街") == ((), "北京路步行街")
+
+    guangzhou_tower = {
+        "name": "广州塔", "type": "风景名胜;风景名胜;风景名胜",
+        "pname": "广东省", "cityname": "广州市", "adname": "海珠区",
+    }
+    aba_valley = {
+        "name": "九寨沟风景名胜区", "type": "风景名胜;风景名胜;国家级景点",
+        "pname": "四川省", "cityname": "阿坝藏族羌族自治州", "adname": "九寨沟县",
+    }
+    assert _poi_match_score("广州塔", guangzhou_tower) > 100
+    assert _poi_match_score("阿坝州九寨沟", aba_valley) > 100
+
+
+def test_query_mentions_location_only_when_user_text_contains_stop_identity():
+    query = "我从永州出发，一个人自驾游广西10天，顺路去荆州洪湖湿地"
+
+    assert _query_directly_mentions_location(query, "荆州市洪湖湿地") is True
+    assert _query_directly_mentions_location(query, "开封市清明上河园") is False
+    assert _query_directly_mentions_location("顺路游广州塔", "广州塔") is True
+    assert _query_directly_mentions_location(
+        "我从成都出发，自驾云南10天", "成都市都江堰景区",
+    ) is False
+    assert _query_directly_mentions_location(
+        "永州出发，自驾广西，喜欢古城", "开封市古城",
+    ) is False
+
+
+def test_same_admin_scenic_candidate_beats_exact_name_out_of_region_restaurant():
+    requested = "甲州市青云山"
+    wrong_exact = {
+        "name": "青云山", "type": "餐饮服务;中餐厅;中餐厅",
+        "pname": "乙省", "cityname": "乙州市", "adname": "乙县",
+    }
+    right_scenic = {
+        "name": "青云山风景区", "type": "风景名胜;风景名胜;风景名胜",
+        "pname": "甲省", "cityname": "甲州市", "adname": "甲县",
+    }
+
+    assert _poi_match_score(requested, wrong_exact) == float("-inf")
+    assert _poi_match_score(requested, right_scenic) > 100
+
+
+def test_non_scenic_named_stop_still_rejects_same_name_restaurant():
+    requested = "甲州市宽窄巷子"
+    wrong_restaurant = {
+        "name": "宽窄巷子", "type": "餐饮服务;中餐厅;中餐厅",
+        "pname": "甲省", "cityname": "甲州市", "adname": "甲县",
+    }
+    right_place = {
+        "name": "宽窄巷子景区", "type": "风景名胜;风景名胜;风景名胜",
+        "pname": "甲省", "cityname": "甲州市", "adname": "甲县",
+    }
+
+    assert _poi_match_score(requested, wrong_restaurant) == float("-inf")
+    assert _poi_match_score(requested, right_place) > 100
+
+
+def test_geocode_all_uses_target_region_for_stop_without_admin_prefix(monkeypatch):
+    from services import route_planner
+
+    wrong_exact = {
+        "id": "wrong", "name": "青云山", "type": "餐饮服务;中餐厅;中餐厅",
+        "pname": "乙省", "cityname": "乙州市", "adname": "乙县",
+        "location": "120.0,30.0",
+    }
+    right_scenic = {
+        "id": "right", "name": "青云山风景区", "type": "风景名胜;风景名胜;风景名胜",
+        "pname": "甲省", "cityname": "甲州市", "adname": "甲县",
+        "location": "110.0,25.0",
+    }
+
+    async def immediate(call):
+        return await call()
+
+    async def fake_request(client, key, path, params):
+        assert params["city"] == "甲省"
+        assert params["citylimit"] == "true"
+        return {"pois": [wrong_exact, right_scenic]}
+
+    monkeypatch.setattr(route_planner, "_amap_paced", immediate)
+    monkeypatch.setattr(route_planner, "_request", fake_request)
+
+    located = asyncio.run(_geocode_all(
+        object(), "test-key", ["青云山"], poi_from_index=0,
+        region_hints=("甲省",),
+    ))
+
+    assert located[0]["poi_id"] == "right"
+    assert located[0]["province"] == "甲省"
+    assert located[0]["admin_match"] is True
+    assert located[0]["type_valid"] is True
+
+
+def test_origin_and_explicit_cross_region_stop_ignore_target_region_hint(monkeypatch):
+    from services import route_planner
+
+    async def immediate(call):
+        return await call()
+
+    async def fake_geocode(client, key, name):
+        assert name == "乙州市"
+        return {
+            "formatted_address": "乙省乙州市", "province": "乙省", "city": "乙州市",
+            "district": [], "location": "120.0,30.0", "level": "市",
+        }
+
+    async def fake_request(client, key, path, params):
+        assert params["city"] == "丙州市"
+        return {"pois": [{
+            "id": "cross-region", "name": "白云湖风景区",
+            "type": "风景名胜;风景名胜;风景名胜",
+            "pname": "丙省", "cityname": "丙州市", "adname": "丙县",
+            "location": "118.0,28.0",
+        }]}
+
+    monkeypatch.setattr(route_planner, "_amap_paced", immediate)
+    monkeypatch.setattr(route_planner, "_geocode", fake_geocode)
+    monkeypatch.setattr(route_planner, "_request", fake_request)
+
+    located = asyncio.run(_geocode_all(
+        object(), "test-key", ["乙州市", "丙州市白云湖"],
+        region_hints=("甲省",),
+    ))
+
+    assert located[0]["city"] == "乙州市"
+    assert located[1]["poi_id"] == "cross-region"
+    assert located[1]["province"] == "丙省"
+
+
+def test_query_region_hint_excludes_explicit_origin_region():
+    assert _extract_query_region_hints("从成都出发，一个人自驾游云南10天") == ("云南",)
+    assert _extract_query_region_hints("湖南永州出发，一个人自驾游广西10天") == ("广西",)
+
+
+def test_model_recommended_explicit_admin_stop_cannot_escape_target_province(
+    monkeypatch,
+):
+    from services import route_planner
+
+    async def fake_geocode(client, key, names, region_hints=()):
+        areas = {
+            "永州": ("湖南省", "永州市", "冷水滩区"),
+            "荆州市洪湖湿地": ("湖北省", "荆州市", "洪湖市"),
+            "桂林市漓江": ("广西壮族自治区", "桂林市", "雁山区"),
+        }
+        return [
+            {
+                "coord": (float(index), float(index)),
+                "resolved_name": name,
+                "poi_name": name,
+                "poi_id": f"poi-{index}",
+                "poi_type": "风景名胜;风景名胜;风景名胜",
+                "province": areas[name][0],
+                "city": areas[name][1],
+                "district": areas[name][2],
+                "admin_match": True,
+                "type_valid": True,
+                "source": "poi",
+            }
+            for index, name in enumerate(names)
+        ]
+
+    monkeypatch.setenv("AMAP_WEB_SERVICE_KEY", "test-key")
+    monkeypatch.setattr(route_planner, "_geocode_all", fake_geocode)
+
+    with pytest.raises(route_planner.RouteLocationValidationError) as exc_info:
+        asyncio.run(_plan_geo(
+            "我从永州出发，一个人自驾游广西10天",
+            {
+                "origin": "永州",
+                "stops": ["荆州市洪湖湿地", "桂林市漓江"],
+                "round_trip": True,
+                "days": 10,
+            },
+        ))
+
+    assert exc_info.value.issues[0]["requested"] == "荆州市洪湖湿地"
+    assert "目标省域之外" in exc_info.value.issues[0]["reason"]
 
 
 def test_distinct_nearby_pois_are_not_collapsed_by_distance_alone():
@@ -420,12 +748,19 @@ def test_required_visit_over_day_budget_is_rejected_instead_of_dropped(isolated_
 def test_geo_pipeline_applies_corridor_gateway_and_visit_metadata(monkeypatch):
     from services import route_planner
 
-    async def fake_geocode(client, key, names):
+    async def fake_geocode(client, key, names, region_hints=()):
         return [
             {
                 "coord": (float(index), float(index)),
                 "poi_name": name,
                 "poi_id": f"poi-{index}",
+                "poi_type": "风景名胜;风景名胜;风景名胜",
+                "province": "新疆维吾尔自治区",
+                "city": "测试市",
+                "district": "测试县",
+                "admin_match": True,
+                "type_valid": True,
+                "source": "poi",
             }
             for index, name in enumerate(names)
         ]
@@ -470,3 +805,14 @@ def test_geo_pipeline_applies_corridor_gateway_and_visit_metadata(monkeypatch):
     assert corridor["km"] == 280.0
     assert corridor["via"] == ["G217独库公路南段", "库车大小龙池"]
     assert route["min_stay_days"]["和静县巴音布鲁克草原"] == 1
+    assert route["location_validation_issues"] == []
+    assert route["schema_version"] == "route-semantics-v6"
+    assert [item["requested"] for item in route["location_resolutions"]] == [
+        "乌鲁木齐",
+        "新源县那拉提旅游风景区",
+        "和静县巴音布鲁克草原",
+        "库车市天山神秘大峡谷",
+        "喀什古城",
+        "塔什库尔干帕米尔旅游区",
+    ]
+    assert route["location_resolutions"][1]["poi_type"].startswith("风景名胜")

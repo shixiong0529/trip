@@ -45,7 +45,7 @@ _amap_lock = asyncio.Lock()
 # 直接复用路线骨架与日程脚手架，Phase 1 的规划耗时归零
 _PLAN_CACHE_TTL = int(os.getenv("ROUTE_PLAN_CACHE_TTL", "7200"))
 _PLAN_CACHE_MAX = 32
-_PLANNER_CACHE_VERSION = "route-semantics-v3"
+_PLANNER_CACHE_VERSION = "route-semantics-v6"
 _route_cache: dict[str, tuple[float, Any]] = {}
 _dayplan_cache: dict[str, tuple[float, Any]] = {}
 
@@ -139,31 +139,325 @@ _MAX_DAILY_DRIVE_HOURS = 10
 _MIN_LEG_KM = 15
 
 
-_ADMIN_PREFIX_RE = re.compile(
-    r"^(?:[^省自治区特别行政区]{1,10}(?:省|自治区|特别行政区))?"
-    r"(?:[^市州地区盟]{1,10}(?:市|自治州|州|地区|盟))?"
-    r"(?:[^县区旗]{1,8}(?:县|自治县|区|旗))?"
+_ADMIN_COMPONENT_PATTERNS = (
+    re.compile(r"^(.{1,15}?(?:特别行政区|自治区|省))"),
+    re.compile(r"^(.{1,15}?(?:自治州|地区|市|州(?!市)|盟))"),
+    re.compile(r"^(.{1,15}?(?:自治县|县|区|旗))"),
 )
+_NON_ADMIN_AREA_SUFFIXES = (
+    "风景区", "景区", "名胜区", "旅游区", "度假区", "保护区",
+    "园区", "开发区", "高新区", "街区", "社区",
+)
+_ROAD_NAME_PREFIXES = ("大道", "公路", "道路", "路", "街", "道", "巷", "弄", "胡同")
+_GENERIC_PLACE_CORES = frozenset({
+    "景区", "风景区", "名胜区", "旅游区", "度假区", "保护区", "公园",
+    "森林公园", "湿地", "古城", "古镇", "古村", "老街", "步行街",
+    "瀑布", "草原", "峡谷", "大峡谷", "梯田", "溶洞", "天坑",
+    "湖", "山", "峰", "谷", "河", "海", "岛", "泉", "寺", "庙", "塔",
+    "博物馆",
+})
 _POI_NOISE_WORDS = (
     "酒店", "宾馆", "民宿", "客栈", "度假农庄", "餐厅", "饭店", "收费站",
     "停车场", "服务区", "旅行社", "售票处", "便利店", "加油站", "游客中心",
-    "打卡点", "立牌",
+    "打卡点", "立牌", "商城", "购物中心", "商店", "超市", "公司",
 )
 _SCENIC_WORDS = (
-    "景区", "风景区", "草原", "峡谷", "古城", "森林公园", "湖", "山",
-    "村", "遗址", "博物馆", "寺", "公园",
+    "景区", "风景区", "名胜区", "草原", "峡谷", "峡", "瀑布", "梯田",
+    "天坑", "溶洞", "古城", "古镇", "古村", "森林公园", "湿地", "沙漠",
+    "湖", "山", "峰", "谷", "河", "海", "岛", "泉", "村", "遗址",
+    "博物馆", "寺", "庙", "宫", "塔", "公园", "保护区", "旅游区",
 )
+
+_POI_INCOMPATIBLE_TYPES = (
+    "餐饮服务", "住宿服务", "购物服务", "生活服务", "公司企业", "金融保险服务",
+    "汽车服务", "汽车销售", "汽车维修", "商务住宅",
+)
+_SCENIC_POI_INCOMPATIBLE_TYPES = (
+    "交通地名;道路名", "交通地名;路口名", "门牌信息", "楼宇信息",
+    "道路附属设施", "医疗保健服务", "科教文化服务;学校",
+)
+_POI_SCENIC_TYPES = (
+    "风景名胜", "自然地名", "公园广场", "科教文化服务;博物馆",
+    "体育休闲服务;休闲场所",
+)
+# 省级行政区全称与常用简称。这里只用于理解用户明确写出的目标省域，
+# 不包含单字车牌简称，避免普通景点名称误命中。
+_PROVINCE_ALIASES = {
+    "北京": ("北京市", "北京"),
+    "天津": ("天津市", "天津"),
+    "上海": ("上海市", "上海"),
+    "重庆": ("重庆市", "重庆"),
+    "河北": ("河北省", "河北"),
+    "山西": ("山西省", "山西"),
+    "辽宁": ("辽宁省", "辽宁"),
+    "吉林": ("吉林省", "吉林"),
+    "黑龙江": ("黑龙江省", "黑龙江"),
+    "江苏": ("江苏省", "江苏"),
+    "浙江": ("浙江省", "浙江"),
+    "安徽": ("安徽省", "安徽"),
+    "福建": ("福建省", "福建"),
+    "江西": ("江西省", "江西"),
+    "山东": ("山东省", "山东"),
+    "河南": ("河南省", "河南"),
+    "湖北": ("湖北省", "湖北"),
+    "湖南": ("湖南省", "湖南"),
+    "广东": ("广东省", "广东"),
+    "海南": ("海南省", "海南"),
+    "四川": ("四川省", "四川"),
+    "贵州": ("贵州省", "贵州"),
+    "云南": ("云南省", "云南"),
+    "陕西": ("陕西省", "陕西"),
+    "甘肃": ("甘肃省", "甘肃"),
+    "青海": ("青海省", "青海"),
+    "台湾": ("台湾省", "台湾"),
+    "内蒙古": ("内蒙古自治区", "内蒙古"),
+    "广西": ("广西壮族自治区", "广西"),
+    "西藏": ("西藏自治区", "西藏"),
+    "宁夏": ("宁夏回族自治区", "宁夏"),
+    "新疆": ("新疆维吾尔自治区", "新疆"),
+    "香港": ("香港特别行政区", "香港"),
+    "澳门": ("澳门特别行政区", "澳门"),
+}
+_ADMIN_SUFFIX_RE = re.compile(
+    r"(?:特别行政区|自治区|自治州|自治县|地区|市|县|区|旗|盟|省)$"
+)
+_PROVINCE_PREFIX_ALIASES = tuple(sorted(
+    {
+        alias
+        for values in _PROVINCE_ALIASES.values()
+        for alias in values
+    },
+    key=len,
+    reverse=True,
+))
+
+
+class RouteLocationValidationError(RuntimeError):
+    """POI 名称虽有候选，但行政区或类型校验表明它不是请求地点。"""
+
+    def __init__(self, issues: list[dict[str, str]]):
+        self.issues = issues
+        summary = "；".join(
+            f"{item.get('requested', '未知地点')}: {item.get('reason', '定位校验失败')}"
+            for item in issues
+        )
+        super().__init__(summary or "路线地点定位校验失败")
+
+
+def _flatten_text_values(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, (list, tuple, set)):
+        return [str(item) for item in value if str(item).strip()]
+    return []
+
+
+def _first_text_value(value: Any) -> Optional[str]:
+    values = _flatten_text_values(value)
+    return values[0] if values else None
+
+
+def _canonical_admin_name(value: str) -> str:
+    text = re.sub(r"\s+", "", unicodedata.normalize("NFKC", value or ""))
+    for canonical, aliases in _PROVINCE_ALIASES.items():
+        if text in aliases:
+            return canonical
+    return _ADMIN_SUFFIX_RE.sub("", text)
+
+
+def _split_admin_prefix(name: str) -> tuple[tuple[str, ...], str]:
+    """拆出地点开头的真实行政单位，不吞掉“景区/度假区”等景点后缀。"""
+    text = re.sub(r"[\s·/（）()，,。:：;；\-—]+", "", name or "")
+    if not text:
+        return (), ""
+
+    units: list[str] = []
+    remaining = text
+
+    # 北京/上海/广西等常以简称直接放在景点名前，不一定带“市/自治区”。
+    province_alias = next(
+        (
+            alias
+            for alias in _PROVINCE_PREFIX_ALIASES
+            if remaining.startswith(alias)
+            and not remaining[len(alias):].startswith(_ROAD_NAME_PREFIXES)
+        ),
+        None,
+    )
+    if province_alias:
+        units.append(province_alias)
+        remaining = remaining[len(province_alias):]
+
+    for pattern in _ADMIN_COMPONENT_PATTERNS:
+        match = pattern.match(remaining)
+        if not match:
+            continue
+        unit = match.group(1)
+        if any(unit.endswith(suffix) for suffix in _NON_ADMIN_AREA_SUFFIXES):
+            break
+        units.append(unit)
+        remaining = remaining[len(unit):]
+
+    return tuple(units), remaining or text
+
+
+def _requested_admin_units(name: str) -> tuple[str, ...]:
+    units, _ = _split_admin_prefix(name)
+    return units
+
+
+def _query_directly_mentions_location(query: str, requested: str) -> bool:
+    """判断跨省 stop 是否确由用户原文点名，而不是抽取模型自行推荐。"""
+    destination_scope = _query_destination_scope(query)
+    normalized = re.sub(
+        r"[\s·/（）()，,。:：;；\-—]+", "",
+        destination_scope,
+    )
+    units, core = _split_admin_prefix(requested)
+    normalized_core = re.sub(r"\W+", "", core)
+    if (
+        len(normalized_core) >= 2
+        and normalized_core not in _GENERIC_PLACE_CORES
+        and normalized_core in normalized
+    ):
+        return True
+
+    admin_tokens = [_canonical_admin_name(unit) for unit in units]
+    admin_tokens.extend(
+        token[:-1]
+        for token, unit in zip(list(admin_tokens), units)
+        if unit.endswith("州") and len(token) > 2
+    )
+    travel_verbs = r"(?:顺路(?:去|到)?|前往|途经|经过|再去|然后去|目的地(?:是|为)?|去|到|游)"
+    return any(
+        len(token) >= 2
+        and re.search(travel_verbs + r".{0,8}" + re.escape(token), normalized)
+        for token in admin_tokens
+        if token
+    )
+
+
+def _query_destination_scope(query: str) -> str:
+    """去掉开头的出发地描述，兼容“从永州出发”和“湖南永州出发”。"""
+    text = unicodedata.normalize("NFKC", query or "")
+    departure = text.find("出发")
+    if 0 <= departure <= 50:
+        return text[departure + len("出发"):]
+    return text
+
+
+def _extract_query_region_hints(query: str) -> tuple[str, ...]:
+    """提取用户明确写出的目标省域，尽量排除“从某省出发”的起点。"""
+    text = unicodedata.normalize("NFKC", query or "")
+    destination_scope = _query_destination_scope(text)
+
+    def collect(scope: str) -> tuple[str, ...]:
+        found = []
+        for canonical, aliases in _PROVINCE_ALIASES.items():
+            if any(alias in scope for alias in sorted(aliases, key=len, reverse=True)):
+                found.append(canonical)
+        return tuple(found)
+
+    return collect(destination_scope) or collect(text)
+
+
+def _candidate_admin_values(candidate: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for field in ("pname", "province", "cityname", "city", "adname", "district"):
+        for item in _flatten_text_values(candidate.get(field)):
+            canonical = _canonical_admin_name(item)
+            if canonical:
+                values.add(canonical)
+    return values
+
+
+def _candidate_provinces(candidate: dict[str, Any]) -> set[str]:
+    values: set[str] = set()
+    for field in ("pname", "province"):
+        for item in _flatten_text_values(candidate.get(field)):
+            canonical = _canonical_admin_name(item)
+            if canonical:
+                values.add(canonical)
+    return values
+
+
+def _admin_match_state(
+    requested: str,
+    candidate: dict[str, Any],
+    region_hints: tuple[str, ...] = (),
+) -> Optional[bool]:
+    units = _requested_admin_units(requested)
+    candidate_admin = _candidate_admin_values(candidate)
+    constrained = bool(units or region_hints)
+    if not constrained:
+        return None
+    if units:
+        required = [(_canonical_admin_name(unit), unit) for unit in units]
+
+        def matches(required_name: str, raw_unit: str) -> bool:
+            if required_name in candidate_admin:
+                return True
+            # “阿坝州/恩施州/伊犁州”是用户常用简称，高德通常返回带民族
+            # 描述的自治州全称；只对“州”简称允许前缀匹配，市县仍严格。
+            return bool(
+                raw_unit.endswith("州")
+                and any(
+                    candidate.startswith(
+                        required_name[:-1]
+                        if required_name.endswith("州")
+                        else required_name
+                    )
+                    for candidate in candidate_admin
+                )
+            )
+
+        if not candidate_admin or not all(
+            matches(required_name, raw_unit)
+            for required_name, raw_unit in required
+        ):
+            return False
+    if region_hints:
+        candidate_provinces = _candidate_provinces(candidate)
+        allowed = {_canonical_admin_name(item) for item in region_hints}
+        if not candidate_provinces or candidate_provinces.isdisjoint(allowed):
+            return False
+    return True
+
+
+def _looks_like_scenic_request(requested: str) -> bool:
+    core = _poi_core_name(requested)
+    return any(word in core for word in _SCENIC_WORDS)
+
+
+def _poi_type_valid(requested: str, poi: dict[str, Any]) -> bool:
+    name = str(poi.get("name") or "")
+    poi_type = " ".join(_flatten_text_values(poi.get("type")))
+    if any(word in name for word in _POI_NOISE_WORDS):
+        return False
+    if any(word in poi_type for word in _POI_INCOMPATIBLE_TYPES):
+        return False
+    if _looks_like_scenic_request(requested) and any(
+        word in poi_type for word in _SCENIC_POI_INCOMPATIBLE_TYPES
+    ):
+        return False
+    return True
 
 
 def _poi_core_name(name: str) -> str:
     """去行政前缀和展示符号，保留用于 POI 身份比对的景点核心名。"""
-    text = re.sub(r"[\s·/（）()，,。:：;；\-—]+", "", name or "")
-    stripped = text[_ADMIN_PREFIX_RE.match(text).end():] if text else ""
-    return stripped or text
+    _, core = _split_admin_prefix(name)
+    return core
 
 
-def _poi_match_score(requested: str, poi: dict[str, Any]) -> float:
-    """给高德候选 POI 做保守名称/类型评分，避免盲取第一条酒店或收费站。"""
+def _poi_match_score(
+    requested: str,
+    poi: dict[str, Any],
+    region_hints: tuple[str, ...] = (),
+) -> float:
+    """给高德候选 POI 评分；行政区或类型冲突属于不可接受候选。"""
+    admin_match = _admin_match_state(requested, poi, region_hints)
+    if admin_match is False or not _poi_type_valid(requested, poi):
+        return float("-inf")
     core = _poi_core_name(requested)
     candidate = _poi_core_name(str(poi.get("name") or ""))
     if not core or not candidate:
@@ -176,11 +470,16 @@ def _poi_match_score(requested: str, poi: dict[str, Any]) -> float:
     else:
         overlap = len(set(core) & set(candidate)) / max(1, len(set(core)))
         score += overlap * 45
-    if any(word in requested for word in _SCENIC_WORDS):
+    if admin_match is True:
+        score += 60
+    if _looks_like_scenic_request(requested):
         if any(word in candidate for word in _POI_NOISE_WORDS):
             score -= 80
         if any(word in candidate for word in _SCENIC_WORDS):
             score += 15
+        poi_type = " ".join(_flatten_text_values(poi.get("type")))
+        if any(word in poi_type for word in _POI_SCENIC_TYPES):
+            score += 20
     return score
 
 
@@ -290,7 +589,8 @@ def _make_notify(on_progress):
 async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tuple[Optional[dict], str]:
     """规划多点自驾路线，返回 (route, status)。
 
-    status: "ok" | "not_applicable"（单目的地/未配置 key）| "failed"
+    status: "ok" | "not_applicable"（单目的地/未配置 key）| "failed" |
+        "invalid_locations"（同名 POI 的行政区或类型校验失败，属于永久错误）
 
     route dict:
         seq_names: 有序途经点（含出发地，环线含返程回到出发地）
@@ -361,6 +661,13 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
     for attempt in (1, 2):
         try:
             route = await _plan_geo(query, extracted, notify)
+        except RouteLocationValidationError as exc:
+            logger.error("路线地点定位永久校验失败，不再降级锁定路线: %s", exc)
+            return {
+                "schema_version": _PLANNER_CACHE_VERSION,
+                "location_resolutions": [],
+                "location_validation_issues": exc.issues,
+            }, "invalid_locations"
         except Exception:
             logger.exception("地图管线第 %d 次异常", attempt)
             route = None
@@ -381,8 +688,8 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
 
 async def plan_route_skeleton(query: str, llm) -> str:
     """兼容旧接口：只取路线骨架 Markdown，失败返回空串。"""
-    route, _ = await plan_route(query, llm)
-    return route["markdown"] if route else ""
+    route, status = await plan_route(query, llm)
+    return route["markdown"] if status == "ok" and route else ""
 
 
 async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Optional[dict]:
@@ -407,21 +714,83 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
     async with httpx.AsyncClient(timeout=20.0) as client:
         names = [origin] + stops
         notify(f"已识别 {len(stops)} 个途经点，正在高德地图逐一定位...")
-        located = await _geocode_all(client, key, names)
+        region_hints = _extract_query_region_hints(query)
+        located = await _geocode_all(client, key, names, region_hints=region_hints)
+        allowed_regions = {_canonical_admin_name(item) for item in region_hints}
+        for index, (name, item) in enumerate(zip(names, located)):
+            if not isinstance(item, dict):
+                continue
+            role = "origin" if index == 0 else "destination"
+            user_named = _query_directly_mentions_location(query, name)
+            item.update({
+                "role": role,
+                "user_named": user_named,
+                "scope_provinces": list(region_hints),
+            })
+            if role == "origin" or not region_hints or not item.get("coord"):
+                item["scope_match"] = None
+                continue
+            candidate_provinces = _candidate_provinces(item)
+            scope_match = bool(
+                candidate_provinces
+                and not candidate_provinces.isdisjoint(allowed_regions)
+            )
+            item["scope_match"] = scope_match
+            if not scope_match and not user_named:
+                resolved_province = _first_text_value(item.get("province")) or "未知省域"
+                item["validation_issue"] = (
+                    f"模型推荐地点落在目标省域之外：实际为{resolved_province}，"
+                    f"用户需求目标为{'、'.join(region_hints)}，且原文未点名该跨省地点"
+                )
+        validation_issues = [
+            {
+                "requested": name,
+                "reason": str(item.get("validation_issue") or "定位校验失败"),
+            }
+            for name, item in zip(names, located)
+            if item and item.get("validation_issue")
+        ]
+        if validation_issues:
+            logger.warning("路线地点候选未通过语义校验: %s", validation_issues)
+            raise RouteLocationValidationError(validation_issues)
         if located[0] is None:
             # 出发地都定位不到，骨架无从谈起（多为高德瞬时故障，值得重试）
             logger.warning("出发地定位失败: %s", origin)
             return None
 
         located_names, located_coords, poi_names, poi_ids, failed = [], [], [], [], []
+        location_resolutions = []
         for name, item in zip(names, located):
-            if item:
+            if item and item.get("coord"):
                 located_names.append(name)
                 located_coords.append(item["coord"])
                 poi_names.append(item.get("poi_name") or "")
                 poi_ids.append(item.get("poi_id"))
+                location_resolutions.append({
+                    "requested": name,
+                    "resolved_name": item.get("resolved_name") or item.get("poi_name") or name,
+                    "source": item.get("source") or ("poi" if item.get("poi_id") else "geocode"),
+                    "poi_id": item.get("poi_id"),
+                    "poi_type": item.get("poi_type"),
+                    "province": item.get("province"),
+                    "city": item.get("city"),
+                    "district": item.get("district"),
+                    "match_score": item.get("match_score"),
+                    "admin_match": item.get("admin_match"),
+                    "type_valid": item.get("type_valid", True),
+                    "role": item.get("role"),
+                    "user_named": item.get("user_named", False),
+                    "scope_provinces": item.get("scope_provinces") or [],
+                    "scope_match": item.get("scope_match"),
+                    "coord": list(item["coord"]),
+                })
             else:
                 failed.append(name)
+        if failed:
+            # 不再用部分路线继续生成，也不把未定位点交给模型“就近插入”。
+            # 地图空结果可能是瞬时故障，返回 None 让 plan_route 重试本阶段。
+            logger.warning("路线存在未解析地点，本轮地图管线失败: %s", failed)
+            return None
         # 除出发地外至少要有 2 个可定位途经点才有排序价值
         if len(located_coords) < 3:
             logger.warning("可定位途经点不足: 成功 %s / 失败 %s", located_names, failed)
@@ -502,12 +871,63 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
                 ca, cb = located_coords[a], located_coords[b]
                 required_days = _required_drive_days(leg)
                 if required_days > 1:
-                    split_points = await _find_split_stop_names(
+                    split_stops = await _find_split_stops(
                         client, key, ca, cb, required_days - 1,
                     )
+                    split_points = [item["name"] for item in split_stops]
                     leg["split_points"] = split_points
                     if split_points:
                         leg["split_hint"] = split_points[len(split_points) // 2]
+                        split_coords = [ca, *[item["coord"] for item in split_stops], cb]
+                        split_km, split_hours, split_measured = await _driving_matrix(
+                            client, key, split_coords,
+                        )
+                        split_nodes = [leg["from"], *split_points, leg["to"]]
+                        split_segments = [
+                            {
+                                "from": split_nodes[index],
+                                "to": split_nodes[index + 1],
+                                "km": split_km[index][index + 1],
+                                "hours": split_hours[index][index + 1],
+                                "measured": split_measured[index][index + 1],
+                            }
+                            for index in range(required_days)
+                        ]
+                        leg["split_segments"] = split_segments
+                        segment_km = sum(float(item["km"]) for item in split_segments)
+                        segment_hours = sum(
+                            float(item["hours"])
+                            for item in split_segments
+                            if item.get("hours") is not None
+                        )
+                        all_measured = all(
+                            item.get("measured") is True
+                            and float(item.get("km") or 0) > 0
+                            and float(item.get("hours") or 0) > 0
+                            and float(item["km"]) <= _MAX_DAILY_DRIVE_KM
+                            and float(item["hours"]) <= _MAX_DAILY_DRIVE_HOURS
+                            for item in split_segments
+                        )
+                        km_consistent = bool(
+                            leg.get("km")
+                            and 0.80 <= segment_km / float(leg["km"]) <= 1.25
+                        )
+                        hours_consistent = bool(
+                            leg.get("hours")
+                            and 0.70 <= segment_hours / float(leg["hours"]) <= 1.35
+                        )
+                        path_verified = all(
+                            item.get("path_verified") is True
+                            for item in split_stops
+                        )
+                        leg["split_verified"] = bool(
+                            path_verified and all_measured
+                            and km_consistent and hours_consistent
+                        )
+                        if not leg["split_verified"]:
+                            leg["split_validation_issue"] = (
+                                "长途分段未获得完整实测线路，或分段里程/时长与原路线不一致"
+                            )
                 else:
                     mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
                     leg["split_hint"] = await _regeo_city(client, key, mid)
@@ -527,6 +947,7 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
             f"攻略「重要提示」中必须说明这一默认，并提示可按实际出发地调整）"
         )
     return {
+        "schema_version": _PLANNER_CACHE_VERSION,
         "seq_names": seq_names,
         "legs": legs,
         "failed": failed,
@@ -535,6 +956,7 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
         "days_budget": days_budget,
         "origin_inferred": origin_inferred,
         "origin": origin,
+        "scope_provinces": list(region_hints),
         "route_notes": rule_context["notes"],
         "blocking_issues": rule_context["blocking_issues"],
         "min_stay_days": {
@@ -547,6 +969,8 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
             for index, requirement in rule_context["visit_requirements"].items()
             if index in merged_names
         },
+        "location_resolutions": location_resolutions,
+        "location_validation_issues": [],
         "markdown": markdown,
     }
 
@@ -617,26 +1041,43 @@ def _parse_location(location: str) -> Optional[tuple[float, float]]:
 
 
 async def _geocode_all(
-    client: httpx.AsyncClient, key: str, names: list[str], poi_from_index: int = 1
+    client: httpx.AsyncClient,
+    key: str,
+    names: list[str],
+    poi_from_index: int = 1,
+    region_hints: tuple[str, ...] = (),
 ) -> list[Optional[dict[str, Any]]]:
-    """逐个定位，返回 {"coord": (lng,lat), "poi_name": str|None} 或 None。
+    """逐个定位并验证行政区/POI 类型。
 
     景点（index >= poi_from_index）优先走 POI 搜索——地理编码只认行政地址，
     "古丈县坐龙峡"会落到古丈县城坐标；而坐龙峡实际在县境最北端、紧贴去
     龙山的高速走廊，用县城坐标排序会把顺路点排成折返。出发地是城市名，
-    直接地理编码更稳。两种方式互为回退。poi_name 保留高德官方名称，
-    其中可能带「(暂停开放)」等状态标注，供上层提取提醒。"""
+    直接地理编码更稳。两种方式互为回退。
 
-    async def query_pois(keyword: str) -> list[dict[str, Any]]:
-        data = await _amap_paced(lambda: _request(client, key, "/place/text", {
+    若高德返回了同名候选，但候选行政区或业务类型与请求冲突，且地址回退
+    也不能精确解析，则返回带 ``validation_issue`` 的永久错误标记；纯空结果
+    仍返回 None，供地图管线按瞬时故障重试。
+    """
+
+    async def query_pois(keyword: str, search_admin: Optional[str]) -> list[dict[str, Any]]:
+        params: dict[str, Any] = {
             "keywords": keyword,
             "offset": 10,
             "page": 1,
             "extensions": "all",
-        }))
+        }
+        if search_admin:
+            params.update({"city": search_admin, "citylimit": "true"})
+        data = await _amap_paced(
+            lambda: _request(client, key, "/place/text", params)
+        )
         return list((data or {}).get("pois") or [])
 
-    async def poi_search(name: str) -> Optional[dict[str, Any]]:
+    async def poi_search(
+        name: str,
+        effective_hints: tuple[str, ...],
+        rejections: list[str],
+    ) -> Optional[dict[str, Any]]:
         # 先查完整名称；如果行政前缀把结果带偏（如“新源县巴音布鲁克”
         # 命中那拉提酒店），再用景点核心名查询。候选按名称/类型评分，
         # 不能再无条件采用第一条。
@@ -644,42 +1085,133 @@ async def _geocode_all(
         core = _poi_core_name(name)
         if core and core != name:
             variants.append(core)
+        admin_units = _requested_admin_units(name)
+        search_admin = admin_units[-1] if admin_units else (
+            effective_hints[0] if len(effective_hints) == 1 else None
+        )
         candidates: list[dict[str, Any]] = []
         for variant in variants:
-            candidates.extend(await query_pois(variant))
-            if candidates and max(_poi_match_score(name, p) for p in candidates) >= 100:
+            candidates.extend(await query_pois(variant, search_admin))
+            if candidates and max(
+                _poi_match_score(name, p, effective_hints) for p in candidates
+            ) >= 100:
                 break
-        ranked = sorted(candidates, key=lambda p: _poi_match_score(name, p), reverse=True)
+        unique: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for poi in candidates:
+            identity = (
+                str(poi.get("id") or ""),
+                str(poi.get("name") or ""),
+                str(poi.get("location") or ""),
+            )
+            unique[identity] = poi
+        candidates = list(unique.values())
+        ranked = sorted(
+            candidates,
+            key=lambda p: _poi_match_score(name, p, effective_hints),
+            reverse=True,
+        )
         for poi in ranked:
-            score = _poi_match_score(name, poi)
+            score = _poi_match_score(name, poi, effective_hints)
             if score < 45:
                 break
             coord = _parse_location(poi.get("location") or "")
             if coord:
+                admin_match = _admin_match_state(name, poi, effective_hints)
                 return {
                     "coord": coord,
+                    "resolved_name": poi.get("name") or name,
                     "poi_name": poi.get("name") or None,
                     "poi_id": poi.get("id") or None,
                     "poi_type": poi.get("type") or None,
-                    "city": poi.get("cityname") or None,
-                    "district": poi.get("adname") or None,
+                    "province": _first_text_value(poi.get("pname")),
+                    "city": _first_text_value(poi.get("cityname")),
+                    "district": _first_text_value(poi.get("adname")),
                     "match_score": score,
+                    "admin_match": admin_match,
+                    "type_valid": True,
+                    "source": "poi",
                 }
+        rejected = []
+        for poi in candidates:
+            admin_match = _admin_match_state(name, poi, effective_hints)
+            type_valid = _poi_type_valid(name, poi)
+            if admin_match is False or not type_valid:
+                rejected.append(
+                    f"{poi.get('name') or '未命名候选'}"
+                    f"（{_first_text_value(poi.get('pname')) or ''}"
+                    f"{_first_text_value(poi.get('cityname')) or ''}"
+                    f"{_first_text_value(poi.get('adname')) or ''}，"
+                    f"类型:{poi.get('type') or '未知'}）"
+                )
+        if rejected:
+            rejections.append("同名 POI 行政区或类型不符: " + "、".join(rejected[:3]))
         return None
 
-    async def geocode(name: str) -> Optional[dict[str, Any]]:
+    async def geocode(
+        name: str,
+        effective_hints: tuple[str, ...],
+        rejections: list[str],
+    ) -> Optional[dict[str, Any]]:
         geo = await _amap_paced(lambda: _geocode(client, key, name))
         coord = _parse_location((geo or {}).get("location") or "")
+        if not coord:
+            return None
+        admin_match = _admin_match_state(name, geo or {}, effective_hints)
+        if admin_match is False:
+            rejections.append(
+                "地址地理编码落在请求行政区之外: "
+                + str((geo or {}).get("formatted_address") or "未知地址")
+            )
+            return None
+        formatted = str((geo or {}).get("formatted_address") or "")
+        if _looks_like_scenic_request(name):
+            core = re.sub(r"\W+", "", _poi_core_name(name))
+            normalized_address = re.sub(r"\W+", "", formatted)
+            if not core or core not in normalized_address:
+                rejections.append(
+                    "地址地理编码只解析到行政区，未解析到景点本身: "
+                    + (formatted or "未知地址")
+                )
+                return None
         return {
             "coord": coord,
+            "resolved_name": formatted or name,
             "poi_name": None,
             "poi_id": None,
+            "poi_type": None,
+            "province": _first_text_value((geo or {}).get("province")),
+            "city": _first_text_value((geo or {}).get("city")),
+            "district": _first_text_value((geo or {}).get("district")),
             "match_score": 0.0,
-        } if coord else None
+            "admin_match": admin_match,
+            "type_valid": True,
+            "source": "geocode",
+        }
 
     async def one(i: int, name: str) -> Optional[dict[str, Any]]:
-        primary, fallback = (poi_search, geocode) if i >= poi_from_index else (geocode, poi_search)
-        return await primary(name) or await fallback(name)
+        # 目标省域只约束“未写行政前缀”的模糊 stop；起点不能被目的地省域
+        # 限制，用户明确点名的跨省 stop 则以自身行政前缀为准。
+        effective_hints = (
+            region_hints
+            if i >= poi_from_index and not _requested_admin_units(name)
+            else ()
+        )
+        rejections: list[str] = []
+        primary, fallback = (
+            (poi_search, geocode) if i >= poi_from_index else (geocode, poi_search)
+        )
+        result = await primary(name, effective_hints, rejections)
+        if result:
+            return result
+        result = await fallback(name, effective_hints, rejections)
+        if result:
+            return result
+        if rejections:
+            return {
+                "validation_issue": "；".join(dict.fromkeys(rejections)),
+                "coord": None,
+            }
+        return None
 
     return list(await asyncio.gather(*[one(i, n) for i, n in enumerate(names)]))
 
@@ -758,6 +1290,38 @@ def _sample_path(
     return sampled
 
 
+async def _find_split_stops(
+    client: httpx.AsyncClient,
+    key: str,
+    origin: tuple[float, float],
+    destination: tuple[float, float],
+    split_count: int,
+) -> list[dict[str, Any]]:
+    """返回长途段每晚的沿途城市及其线路采样坐标。"""
+    points = await _driving_polyline(client, key, origin, destination)
+    path_verified = bool(points)
+    if not points:
+        points = [origin, destination]
+    coords = _sample_path(points, split_count)
+    resolved = await asyncio.gather(*[
+        _regeo_city(client, key, coord) for coord in coords
+    ])
+    stops = []
+    used_names: set[str] = set()
+    for index, (coord, name) in enumerate(zip(coords, resolved), 1):
+        if not name:
+            name = f"沿途第{index}晚安全落脚点（出发前按导航复核）"
+        elif name in used_names:
+            name = f"{name}附近（第{index}晚）"
+        used_names.add(name)
+        stops.append({
+            "name": name,
+            "coord": coord,
+            "path_verified": path_verified,
+        })
+    return stops
+
+
 async def _find_split_stop_names(
     client: httpx.AsyncClient,
     key: str,
@@ -765,22 +1329,13 @@ async def _find_split_stop_names(
     destination: tuple[float, float],
     split_count: int,
 ) -> list[str]:
-    """返回长途段每晚的具体沿途城市，数量始终与所需中途夜数一致。"""
-    points = await _driving_polyline(client, key, origin, destination)
-    if not points:
-        points = [origin, destination]
-    coords = _sample_path(points, split_count)
-    resolved = await asyncio.gather(*[
-        _regeo_city(client, key, coord) for coord in coords
-    ])
-    names = []
-    for index, name in enumerate(resolved, 1):
-        if not name:
-            name = f"沿途第{index}晚安全落脚点（出发前按导航复核）"
-        elif name in names:
-            name = f"{name}附近（第{index}晚）"
-        names.append(name)
-    return names
+    """兼容旧调用：仅返回长途段沿途城市名称。"""
+    return [
+        item["name"]
+        for item in await _find_split_stops(
+            client, key, origin, destination, split_count,
+        )
+    ]
 
 
 def _route_cost(dist: list[list[float]], order: list[int], round_trip: bool) -> float:
@@ -936,10 +1491,21 @@ async def _driving_matrix(
                     hrs = float(item.get("duration", 0)) / 3600
                 except (TypeError, ValueError):
                     km = hrs = None
-            if km and km > 0:
+            straight_km = _haversine(coords[i], coords[j])
+            plausible = bool(
+                km and km > 0
+                and (straight_km <= 0.2 or km >= straight_km * 0.85)
+            )
+            if plausible:
                 dist[i][j], dur[i][j], measured[i][j] = km, hrs, True
             else:
-                dist[i][j], dur[i][j], measured[i][j] = _haversine(coords[i], coords[j]) * 1.4, None, False
+                if km and km > 0:
+                    logger.warning(
+                        "高德驾车距离短于地理直线距离，拒绝异常矩阵值: "
+                        "%s -> %s, driving=%.1fkm, straight=%.1fkm",
+                        coords[i], coords[j], km, straight_km,
+                    )
+                dist[i][j], dur[i][j], measured[i][j] = straight_km * 1.4, None, False
 
     # 逐列查询；_amap_paced 内部已全局节流，无需再并发
     for j in range(n):
@@ -1094,8 +1660,31 @@ def _expand_unsafe_legs(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 if hint else f"沿途第{number}晚安全落脚点（出发前按导航复核）"
             )
         nodes = [leg["from"], *points, leg["to"]]
-        kms = _split_total(leg.get("km"), required_days)
-        hours = _split_total(leg.get("hours"), required_days)
+        split_segments = list(leg.get("split_segments") or [])
+        has_measured_segments = bool(
+            leg.get("split_verified") is True
+            and len(split_segments) == required_days
+            and all(
+                segment.get("from") == nodes[index]
+                and segment.get("to") == nodes[index + 1]
+                and isinstance(segment.get("km"), (int, float))
+                and segment["km"] > 0
+                and isinstance(segment.get("hours"), (int, float))
+                and segment["hours"] > 0
+                and segment.get("measured") is True
+                for index, segment in enumerate(split_segments)
+            )
+        )
+        if has_measured_segments:
+            kms = [segment["km"] for segment in split_segments]
+            hours = [segment.get("hours") for segment in split_segments]
+            measured = [bool(segment.get("measured")) for segment in split_segments]
+        else:
+            # 旧缓存/测试夹具没有中途点坐标，只能按总量估分段；明确标为估算，
+            # 避免把机械平均后的数字伪装成地图实测结果。
+            kms = _split_total(leg.get("km"), required_days)
+            hours = _split_total(leg.get("hours"), required_days)
+            measured = [False] * required_days
         group_id = f"long-{group_index}"
         for index, (start, end) in enumerate(zip(nodes, nodes[1:]), 1):
             expanded.append({
@@ -1104,7 +1693,9 @@ def _expand_unsafe_legs(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "via": [],
                 "km": kms[index - 1],
                 "hours": hours[index - 1],
-                "measured": leg.get("measured", False),
+                "measured": measured[index - 1],
+                "estimated_split": not has_measured_segments,
+                "split_verified": has_measured_segments,
                 "is_return": bool(leg.get("is_return") and index == required_days),
                 "is_safety_stop": index < required_days,
                 "long_leg_group": group_id,
@@ -1173,11 +1764,23 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         round_trip = route.get("round_trip", True)
     except (KeyError, TypeError):
         return None
-    # 缓存键绑定 query + 骨架内容：路线缓存过期重算后骨架若有变化，
-    # 旧日程缓存自动失效，不会出现路线与日程不配套
+    # 缓存键绑定 query + 完整结构化骨架。仅绑定 Markdown 不够：长途段的
+    # split_segments 实测值可能变化，但总里程和过夜点名称仍完全相同。
+    # 纳入 legs 后，旧日程不会错误复用另一组分段里程。
+    route_fingerprint = hashlib.sha256(json.dumps(
+        {
+            "seq_names": seq_names,
+            "legs": legs,
+            "round_trip": round_trip,
+            "days_budget": route.get("days_budget"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
     cache_key = (
         _PLANNER_CACHE_VERSION + "\n" + _normalize_query_for_cache(query)
-        + "\n" + route.get("markdown", "")
+        + "\n" + route.get("markdown", "") + "\n" + route_fingerprint
     )
     cached = _cache_get(_dayplan_cache, cache_key)
     if cached is not None:
@@ -1266,6 +1869,8 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
             "from": leg["from"], "to": leg["to"],
             "via": list(leg.get("via") or []),
             "km": leg["km"], "hours": leg["hours"], "measured": leg["measured"],
+            "estimated_split": leg.get("estimated_split", False),
+            "split_verified": leg.get("split_verified"),
             "is_return": leg.get("is_return", False),
             "split_hint": leg.get("split_hint"),
             "is_safety_stop": leg.get("is_safety_stop", False),
@@ -1541,7 +2146,10 @@ def _render_scaffold(
     for day in days:
         if day["kind"] == "transfer":
             hours = f" · 约 {day['hours']:.1f}h" if day["hours"] is not None else ""
-            est = "" if day["measured"] else "（直线估算）"
+            if day.get("estimated_split"):
+                est = "（分段估算）"
+            else:
+                est = "" if day["measured"] else "（直线估算）"
             tail = "（返程回到出发地）" if day.get("is_return") else ""
             path = " → ".join([day["from"]] + list(day.get("via") or []) + [day["to"]])
             lines.append(

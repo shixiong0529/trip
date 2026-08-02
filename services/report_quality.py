@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 import json
+import math
 import re
 import unicodedata
 from typing import Any, Iterable, Mapping, Sequence
@@ -23,6 +24,7 @@ ALLOWED_CATEGORIES = frozenset({
     "knowledge_graph",
     "route_order",
     "route_consistency",
+    "location_mismatch",
     "driving_feasibility",
     "must_visit",
     "requirement_mismatch",
@@ -42,6 +44,7 @@ MIN_LLM_ISSUE_CONFIDENCE = 0.8
 # 因模型误用动作而让整次请求直接失败。
 _LLM_ROUTE_REPLAN_CATEGORIES = frozenset({
     "route_order",
+    "location_mismatch",
     "driving_feasibility",
     "must_visit",
     "requirement_mismatch",
@@ -334,6 +337,230 @@ def _program_issue(
         suggested_action=action,
         source="program",
     )
+
+
+def audit_route_plan(
+    query: str,
+    route: Mapping[str, Any] | None,
+    day_plan: Mapping[str, Any] | None = None,
+) -> list[ReviewIssue]:
+    """在正文生成前校验路线定位元数据与单日驾驶硬上限。
+
+    这道门禁同时服务标准版和专业版。它不判断攻略文风，只阻止已经被
+    地图层证明为未解析、行政区不符或类型错误的地点进入锁定骨架。
+    """
+    route = route or {}
+    issues: list[ReviewIssue] = []
+
+    def add(**kwargs: Any) -> None:
+        issues.append(_program_issue(len(issues) + 1, **kwargs))
+
+    validation = route.get("location_validation_issues")
+    if isinstance(validation, list):
+        for item in validation:
+            if not isinstance(item, Mapping):
+                continue
+            requested = _clean_text(item.get("requested"), 200) or "未知地点"
+            reason = _clean_text(item.get("reason"), 300) or "地图定位未通过校验"
+            add(
+                severity="critical",
+                category="location_mismatch",
+                locations=(requested,),
+                diagnosis=f"路线节点「{requested}」定位校验失败：{reason}",
+                repair_instruction="重新定位并重建路线骨架，禁止沿用当前坐标或让正文模型猜测",
+                action="route_replan",
+            )
+
+    from services.route_planner import (
+        _extract_query_region_hints,
+        _query_directly_mentions_location,
+        _requested_admin_units,
+    )
+
+    query_scope = tuple(_extract_query_region_hints(query))
+    route_scope = tuple(route.get("scope_provinces") or query_scope)
+    schema_current = route.get("schema_version") == "route-semantics-v6"
+    resolutions = route.get("location_resolutions")
+    if schema_current and (not isinstance(resolutions, list) or not resolutions):
+        add(
+            severity="critical",
+            category="location_mismatch",
+            diagnosis="新版路线缺少地点解析元数据，无法证明锁定坐标可信",
+            repair_instruction="重新执行地点定位和省域校验后再生成路线",
+            action="route_replan",
+        )
+    if isinstance(resolutions, list):
+        for item in resolutions:
+            if not isinstance(item, Mapping):
+                continue
+            admin_invalid = item.get("admin_match") is False
+            type_invalid = item.get("type_valid") is False
+            role = item.get("role") or "destination"
+            requested = _clean_text(item.get("requested"), 200) or "未知地点"
+            # 不信任上游 user_named 布尔值，直接用本次原始需求复核；否则
+            # 起点城市或“古城/瀑布”等泛词命中就可能绕过目标省域门禁。
+            user_named = _query_directly_mentions_location(query, requested)
+            scope_invalid = bool(
+                role == "destination"
+                and route_scope
+                and not user_named
+                and item.get("scope_match") is not True
+            )
+            metadata_missing = bool(
+                schema_current
+                and (
+                    item.get("type_valid") is not True
+                    or (
+                        _requested_admin_units(requested)
+                        and item.get("admin_match") is not True
+                    )
+                )
+            )
+            if not (admin_invalid or type_invalid or scope_invalid or metadata_missing):
+                continue
+            resolved = _clean_text(item.get("resolved_name"), 200) or "未知地图结果"
+            resolved_area = "".join(
+                _clean_text(item.get(key), 80)
+                for key in ("province", "city", "district")
+            )
+            reasons = []
+            if admin_invalid:
+                reasons.append("行政区与请求名称不一致")
+            if type_invalid:
+                poi_type = _clean_text(item.get("poi_type"), 120)
+                reasons.append(
+                    "POI 类型不适合作为旅行目的地"
+                    + (f"（{poi_type}）" if poi_type else "")
+                )
+            if scope_invalid:
+                reasons.append(
+                    f"模型推荐地点超出用户目标省域（{'、'.join(route_scope)}）"
+                )
+            if metadata_missing:
+                reasons.append("地点校验元数据不完整")
+            add(
+                severity="critical",
+                category="location_mismatch",
+                locations=(requested,),
+                evidence=f"{requested} -> {resolved_area}{resolved}",
+                diagnosis=(
+                    f"路线节点「{requested}」被解析为「{resolved_area}{resolved}」："
+                    + "；".join(reasons)
+                ),
+                repair_instruction="淘汰错误候选，使用行政区和类型均匹配的地图结果后重建路线",
+                action="route_replan",
+            )
+
+    for index, leg in enumerate(route.get("legs") or [], 1):
+        if not isinstance(leg, Mapping):
+            continue
+        try:
+            km = float(leg.get("km") or 0)
+            hours = float(leg.get("hours") or 0)
+        except (TypeError, ValueError):
+            continue
+        required_days = max(
+            1,
+            math.ceil(km / 800) if km > 0 else 1,
+            math.ceil(hours / 10) if hours > 0 else 1,
+        )
+        if required_days <= 1:
+            continue
+        segments = leg.get("split_segments")
+
+        def valid_segment(segment: Any) -> bool:
+            if not isinstance(segment, Mapping) or segment.get("measured") is not True:
+                return False
+            try:
+                segment_km = float(segment.get("km") or 0)
+                segment_hours = float(segment.get("hours") or 0)
+            except (TypeError, ValueError):
+                return False
+            return 0 < segment_km <= 800 and 0 < segment_hours <= 10
+
+        segment_list = segments if isinstance(segments, list) else []
+        individually_valid = bool(
+            len(segment_list) == required_days
+            and all(valid_segment(segment) for segment in segment_list)
+        )
+        chain_valid = bool(
+            individually_valid
+            and segment_list[0].get("from") == leg.get("from")
+            and segment_list[-1].get("to") == leg.get("to")
+            and all(
+                left.get("to") == right.get("from")
+                for left, right in zip(segment_list, segment_list[1:])
+            )
+        )
+        segment_km_total = sum(
+            float(segment.get("km") or 0) for segment in segment_list
+        ) if individually_valid else 0
+        segment_hours_total = sum(
+            float(segment.get("hours") or 0) for segment in segment_list
+        ) if individually_valid else 0
+        totals_consistent = bool(
+            km > 0 and hours > 0
+            and 0.80 <= segment_km_total / km <= 1.25
+            and 0.70 <= segment_hours_total / hours <= 1.35
+        )
+        valid_segments = bool(
+            leg.get("split_verified") is True
+            and chain_valid
+            and totals_consistent
+        )
+        if valid_segments:
+            continue
+        start = _clean_text(leg.get("from"), 100) or f"第{index}段起点"
+        end = _clean_text(leg.get("to"), 100) or f"第{index}段终点"
+        detail = _clean_text(leg.get("split_validation_issue"), 240)
+        add(
+            severity="critical",
+            category="driving_feasibility",
+            locations=(start, end),
+            diagnosis=(
+                f"长途段「{start} → {end}」没有通过逐段实测校验"
+                + (f"：{detail}" if detail else "")
+            ),
+            repair_instruction="重新获取真实驾车折线并逐段测距，禁止用机械平均里程发布",
+            action="route_replan",
+        )
+
+    days = (day_plan or {}).get("days")
+    if isinstance(days, list):
+        for day in days:
+            if not isinstance(day, Mapping) or day.get("kind") != "transfer":
+                continue
+            try:
+                number = int(day.get("day"))
+                km = float(day.get("km") or 0)
+                hours = float(day.get("hours") or 0)
+            except (TypeError, ValueError):
+                continue
+            unverified_split = bool(
+                day.get("long_leg_group")
+                and (
+                    day.get("measured") is not True
+                    or day.get("estimated_split") is True
+                    or day.get("split_verified") is not True
+                    or hours <= 0
+                )
+            )
+            if km <= 800 and hours <= 10 and not unverified_split:
+                continue
+            add(
+                severity="critical",
+                category="driving_feasibility",
+                locations=(f"Day {number}",),
+                diagnosis=(
+                    f"锁定 day_plan 的 Day {number} 长途分段未经真实地图验证"
+                    if unverified_split
+                    else f"锁定 day_plan 的 Day {number} 超过单日 800km/10h 驾驶上限"
+                ),
+                repair_instruction="先拆分并实测该长途路段，再生成报告正文",
+                action="route_replan",
+            )
+
+    return issues
 
 
 def _section_ranges(content: str) -> dict[str, str]:
@@ -703,6 +930,70 @@ def audit_report(
                 )
 
     route = route or {}
+
+    # 路线正文可以百分之百服从一条错误骨架，因此必须独立检查地图定位阶段
+    # 留下的 requested -> resolved 证据。任何未解析、行政区不符或 POI 类型
+    # 不适合作为旅行目的地的问题，都只能重建路线，不能靠改写正文掩盖。
+    location_validation_issues = route.get("location_validation_issues")
+    if isinstance(location_validation_issues, list):
+        for item in location_validation_issues:
+            if not isinstance(item, Mapping):
+                continue
+            requested = _clean_text(item.get("requested"), 200) or "未知地点"
+            reason = _clean_text(item.get("reason"), 300) or "地图定位未通过校验"
+            add(
+                severity="critical",
+                category="location_mismatch",
+                locations=(requested,),
+                diagnosis=f"路线节点「{requested}」定位校验失败：{reason}",
+                repair_instruction="重新定位并重建路线骨架，禁止沿用当前坐标或让正文模型猜测",
+                action="route_replan",
+            )
+
+    location_resolutions = route.get("location_resolutions")
+    route_scope = tuple(route.get("scope_provinces") or ())
+    from services.route_planner import _query_directly_mentions_location
+    if isinstance(location_resolutions, list):
+        for item in location_resolutions:
+            if not isinstance(item, Mapping):
+                continue
+            admin_invalid = item.get("admin_match") is False
+            type_invalid = item.get("type_valid") is False
+            scope_invalid = bool(
+                (item.get("role") or "destination") == "destination"
+                and route_scope
+                and not _query_directly_mentions_location(
+                    query,
+                    _clean_text(item.get("requested"), 200),
+                )
+                and item.get("scope_match") is not True
+            )
+            if not (admin_invalid or type_invalid or scope_invalid):
+                continue
+            requested = _clean_text(item.get("requested"), 200) or "未知地点"
+            resolved = _clean_text(item.get("resolved_name"), 200) or "未知地图结果"
+            resolved_area = "".join(
+                _clean_text(item.get(key), 80)
+                for key in ("province", "city", "district")
+            )
+            reasons = []
+            if admin_invalid:
+                reasons.append("行政区与请求名称不一致")
+            if type_invalid:
+                poi_type = _clean_text(item.get("poi_type"), 120)
+                reasons.append(f"POI 类型不适合作为旅行目的地{f'（{poi_type}）' if poi_type else ''}")
+            if scope_invalid:
+                reasons.append(f"模型推荐地点超出用户目标省域（{'、'.join(route_scope)}）")
+            add(
+                severity="critical",
+                category="location_mismatch",
+                locations=(requested,),
+                evidence=f"{requested} -> {resolved_area}{resolved}",
+                diagnosis=f"路线节点「{requested}」被解析为「{resolved_area}{resolved}」：{'；'.join(reasons)}",
+                repair_instruction="淘汰错误候选，使用行政区和类型均匹配的地图结果后重建路线",
+                action="route_replan",
+            )
+
     seq_names = route.get("seq_names")
     if isinstance(seq_names, list):
         for place in dict.fromkeys(str(item).strip() for item in seq_names if str(item).strip()):
@@ -949,6 +1240,7 @@ def build_review_messages(
     travel_data: Mapping[str, Any] | None = None,
     day_plan: Mapping[str, Any] | None = None,
     program_issues: Iterable[ReviewIssue] = (),
+    route: Mapping[str, Any] | None = None,
 ) -> list[dict[str, str]]:
     """构建独立审核会话；只诊断，不允许审核模型顺手改写正文。"""
     categories = ", ".join(sorted(ALLOWED_CATEGORIES))
@@ -968,7 +1260,7 @@ def build_review_messages(
 5. 已被程序问题清单覆盖的同一问题无需重复；没有新问题时 issues=[]；
 6. Day 标题中出现的途经点已经算明确落实，不能声称“未明确为途经点”；
 7. 景点安排 2-3 小时本身不构成 major。只有报告内的时间明确重叠、总时长算术不成立，或违反锁定硬约束时，才报 timing_feasibility；
-8. 程序预检为空表示 Day 数量、标题顺序、锁定路线、里程时长、必游点和必要板块已通过确定性校验。除非正文有可逐字引用的直接矛盾，不得再以主观偏好报 route_consistency；
+8. 程序预检为空只表示正文结构与当前锁定骨架一致，不代表骨架的地图定位必然正确。必须结合用户原始需求和路线定位摘要，检查锁定 day_plan 本身是否出现目的地区域越界、显示地名与实际行政区不一致或明显无意义折返；不得因为“已锁定”而忽略这类硬伤；
 9. 需要整篇重写的 major/critical 必须会实质改变路线可执行性、用户硬需求或内部一致性。仅增加一句说明、调整措辞或延长普通景点停留时间的建议应标 minor 或省略。"""
     system += (
         "\n10. 大型景区、湖区和自然保护区可能横跨多个行政区，地名不同本身不能证明底层路线骨架错误，"
@@ -980,6 +1272,14 @@ def build_review_messages(
 
 【程序锁定 day_plan】
 {_limited_json(day_plan or {}, 12_000)}
+
+【程序路线与地图定位摘要】
+{_limited_json({
+    "seq_names": (route or {}).get("seq_names"),
+    "legs": (route or {}).get("legs"),
+    "location_resolutions": (route or {}).get("location_resolutions"),
+    "location_validation_issues": (route or {}).get("location_validation_issues"),
+}, 14_000)}
 
 【实时数据摘要】
 {_limited_json(travel_data or {}, 18_000)}
@@ -1037,6 +1337,7 @@ __all__ = [
     "ReviewIssue",
     "ReviewResult",
     "audit_report",
+    "audit_route_plan",
     "build_repair_messages",
     "build_review_messages",
     "decide_review_action",
