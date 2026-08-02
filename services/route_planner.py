@@ -6,10 +6,11 @@
 2. 高德地理编码取得各点坐标
 3. 高德批量测距得到两两驾车距离矩阵（山区路网与直线差异大，
    直线最短环线常把顺路点排成折返，故必须用实测驾车距离）
-4. 在驾车距离矩阵上求最短环线（点少穷举，点多贪心+2-opt）
+4. 在驾车距离矩阵上求较短环线（点少穷举，点多贪心+2-opt）
+5. 施加景观道路有序走廊、门户往返支线和最低游览时间约束
 
-产出可注入提示词的「路线骨架」Markdown，从源头避免 Z 字形绕路
-和"凑天数折返"。任何一步失败都返回空串，退化为纯 LLM 排线。
+产出可注入提示词的「路线骨架」Markdown；天数明显装不下时不锁定
+不可执行骨架。外部接口失败仍可返回空结果，由编排层决定是否降级。
 """
 
 import asyncio
@@ -30,6 +31,7 @@ import httpx
 from dotenv import load_dotenv
 
 from services.amap_client import AMAP_BASE_URL, _geocode, _request
+from services.route_rules import canonicalize_corridor_stops, resolve_route_rules
 
 load_dotenv()
 
@@ -43,7 +45,7 @@ _amap_lock = asyncio.Lock()
 # 直接复用路线骨架与日程脚手架，Phase 1 的规划耗时归零
 _PLAN_CACHE_TTL = int(os.getenv("ROUTE_PLAN_CACHE_TTL", "7200"))
 _PLAN_CACHE_MAX = 32
-_PLANNER_CACHE_VERSION = "safe-long-leg-v1"
+_PLANNER_CACHE_VERSION = "route-semantics-v3"
 _route_cache: dict[str, tuple[float, Any]] = {}
 _dayplan_cache: dict[str, tuple[float, Any]] = {}
 
@@ -137,21 +139,83 @@ _MAX_DAILY_DRIVE_HOURS = 10
 _MIN_LEG_KM = 15
 
 
+_ADMIN_PREFIX_RE = re.compile(
+    r"^(?:[^省自治区特别行政区]{1,10}(?:省|自治区|特别行政区))?"
+    r"(?:[^市州地区盟]{1,10}(?:市|自治州|州|地区|盟))?"
+    r"(?:[^县区旗]{1,8}(?:县|自治县|区|旗))?"
+)
+_POI_NOISE_WORDS = (
+    "酒店", "宾馆", "民宿", "客栈", "度假农庄", "餐厅", "饭店", "收费站",
+    "停车场", "服务区", "旅行社", "售票处", "便利店", "加油站", "游客中心",
+    "打卡点", "立牌",
+)
+_SCENIC_WORDS = (
+    "景区", "风景区", "草原", "峡谷", "古城", "森林公园", "湖", "山",
+    "村", "遗址", "博物馆", "寺", "公园",
+)
+
+
+def _poi_core_name(name: str) -> str:
+    """去行政前缀和展示符号，保留用于 POI 身份比对的景点核心名。"""
+    text = re.sub(r"[\s·/（）()，,。:：;；\-—]+", "", name or "")
+    stripped = text[_ADMIN_PREFIX_RE.match(text).end():] if text else ""
+    return stripped or text
+
+
+def _poi_match_score(requested: str, poi: dict[str, Any]) -> float:
+    """给高德候选 POI 做保守名称/类型评分，避免盲取第一条酒店或收费站。"""
+    core = _poi_core_name(requested)
+    candidate = _poi_core_name(str(poi.get("name") or ""))
+    if not core or not candidate:
+        return float("-inf")
+    score = 0.0
+    if core == candidate:
+        score += 120
+    elif core in candidate or candidate in core:
+        score += 90
+    else:
+        overlap = len(set(core) & set(candidate)) / max(1, len(set(core)))
+        score += overlap * 45
+    if any(word in requested for word in _SCENIC_WORDS):
+        if any(word in candidate for word in _POI_NOISE_WORDS):
+            score -= 80
+        if any(word in candidate for word in _SCENIC_WORDS):
+            score += 15
+    return score
+
+
 def _collapse_near_stops(
     seq: list[int],
     names: list[str],
     dist_km: list[list[float]],
+    poi_ids: Optional[list[Optional[str]]] = None,
 ) -> tuple[list[int], dict[int, str]]:
-    """把序列中相距 <_MIN_LEG_KM 的相邻途经点合并为一站。
+    """只把“同一个 POI”的近邻重复项合并为一站。
 
-    返回 (新序列, 各保留索引的展示名)。被并入的点名字拼进保留点
-    （去掉重复的县市前缀），出发地（索引 0）永不参与合并。
+    仅凭坐标接近不能证明两个景点相同：错误地理编码曾把巴音布鲁克落到
+    那拉提附近，旧逻辑因此把两个相距 200km+ 的景区静默合并。现在必须
+    POI ID 相同，或名称核心明显为同一地点，才允许合并。不同的近邻景点
+    交给日程层安排成同日串点，不再破坏目的地身份。
     """
+    poi_ids = poi_ids or [None] * len(names)
     merged_names = {i: names[i] for i in set(seq)}
     collapsed = [seq[0]]
     for idx in seq[1:]:
         prev = collapsed[-1]
-        if idx != 0 and prev != 0 and dist_km[prev][idx] < _MIN_LEG_KM:
+        same_poi = bool(
+            prev < len(poi_ids) and idx < len(poi_ids)
+            and poi_ids[prev] and poi_ids[prev] == poi_ids[idx]
+        )
+        prev_core = _poi_core_name(names[prev])
+        next_core = _poi_core_name(names[idx])
+        same_name = bool(
+            prev_core and next_core
+            and (prev_core in next_core or next_core in prev_core)
+        )
+        if (
+            idx != 0 and prev != 0 and dist_km[prev][idx] < _MIN_LEG_KM
+            and (same_poi or same_name)
+        ):
             extra = names[idx]
             # 共享县/市前缀时只留景点名，如 "溆浦县山背梯田·花瑶古寨"
             for cut in range(min(len(extra), len(names[prev])), 1, -1):
@@ -199,7 +263,12 @@ _EXTRACT_TEMPLATE = """从下面的旅行需求中抽取自驾途经点，输出
 {{"origin": "出发地", "origin_inferred": false, "stops": ["途经点1", "途经点2"], "user_fixed_order": false, "round_trip": true, "days": null}}
 
 - stops 是需要前往游玩的具体景点/目的地列表（不含出发地），每项写成「县市名+景点名」（如 "龙山县八面山"、"古丈县坐龙峡"），便于精确定位到景点本身而不是县城
+- 行政区不确定时宁可只写准确景点名，禁止猜一个县市前缀；错误前缀会把地图定位到同名商户或错误城市
 - 只有相距很近（同一景区、<20km）的景点才合并为一项；同县但相距较远的景点必须各自单独列出
+- stops 必须能在用户总天数内真正游览：至少预留约 1/4 天数用于景区深度游/休整；用户只说省域或大区域时，选择一条连贯子线路，禁止把相距极远的所有热门景点都塞进去
+- 例如 14 天闭环自驾通常最多列 10 个 stops（另有返程转移日并预留约 3 个深度游日）；不要输出 14 个 stops 再让每天都变成赶路
+- 景观公路不是普通 POI。若线路采用某条景观公路，必须把其关键入口、游览节点和出口分别列为独立 stops，不能合并；例如采用独库公路时，那拉提、巴音布鲁克、库车大峡谷必须分开
+- 必须识别“门户城市往返支线”：例如塔什库尔干/帕米尔需从喀什进入并回到喀什；若总天数容不下该往返，应删掉这个模型推荐支线，不能安排其他城市直接冲塔县
 - 用户明确指定了游览顺序时 user_fixed_order 为 true，stops 按用户顺序排列
 - round_trip 默认为 true（自驾默认回出发地取/还车）；只有用户明确表示单程、异地还车、或以其他城市为终点时才为 false
 - 用户明确给出总天数（如"7天""十日游"）时 days 填该整数；给的是范围（如"7-10天"）取上限；未提及时为 null
@@ -273,6 +342,8 @@ async def plan_route(query: str, llm, fallback_llm=None, on_progress=None) -> tu
 
     origin = (extracted.get("origin") or "").strip()
     stops = [s.strip() for s in extracted.get("stops") or [] if s and s.strip()]
+    stops = canonicalize_corridor_stops(query, stops)
+    extracted = dict(extracted, stops=stops)
     if len(stops) < 2:
         # 单目的地不存在排序问题，交给既有的高德参考数据即可
         logger.info("路线规划不适用（单目的地），交给常规流程")
@@ -322,6 +393,7 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
     key = os.getenv("AMAP_WEB_SERVICE_KEY", "").strip()
     origin = (extracted.get("origin") or "").strip()
     stops = [s.strip() for s in extracted.get("stops") or [] if s and s.strip()]
+    stops = canonicalize_corridor_stops(query, stops)
     user_fixed_order = bool(extracted.get("user_fixed_order"))
     origin_inferred = bool(extracted.get("origin_inferred"))
     round_trip = extracted.get("round_trip", True) is not False
@@ -341,12 +413,13 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
             logger.warning("出发地定位失败: %s", origin)
             return None
 
-        located_names, located_coords, poi_names, failed = [], [], [], []
+        located_names, located_coords, poi_names, poi_ids, failed = [], [], [], [], []
         for name, item in zip(names, located):
             if item:
                 located_names.append(name)
                 located_coords.append(item["coord"])
                 poi_names.append(item.get("poi_name") or "")
+                poi_ids.append(item.get("poi_id"))
             else:
                 failed.append(name)
         # 除出发地外至少要有 2 个可定位途经点才有排序价值
@@ -364,27 +437,62 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
         notify("定位完成，正在实测两两驾车距离并计算最短环线...")
         dist_km, dur_h, measured = await _driving_matrix(client, key, located_coords)
 
+        rule_context = resolve_route_rules(
+            query, located_names, active_indices=range(len(located_names)),
+        )
+        planning_dist = [row[:] for row in dist_km]
+        for (left, right), override in rule_context["leg_overrides"].items():
+            if override.get("km") is not None:
+                planning_dist[left][right] = float(override["km"])
         if user_fixed_order:
             order = list(range(1, len(located_coords)))
         else:
-            order = _best_order(dist_km, round_trip)
+            # 景观走廊先作为有序连续块参与排序；门户支线目的地从普通 TSP
+            # 中拿出，排序完成后展开成 gateway→destination→gateway。
+            excursion_destinations = {
+                item["destination"] for item in rule_context["gateway_excursions"]
+            }
+            base_indices = [
+                i for i in range(1, len(located_coords))
+                if i not in excursion_destinations
+            ]
+            order = _best_order(
+                planning_dist,
+                round_trip,
+                indices=base_indices,
+                ordered_chains=rule_context["ordered_chains"],
+            )
+            order = _insert_gateway_excursions(
+                order, rule_context["gateway_excursions"]
+            )
 
         seq = [0] + order + ([0] if round_trip else [])
         # 相邻途经点近到没有独立转移意义时（如"山背梯田"与紧邻的"花瑶古寨"
         # 实测 <15km）合并为一站顺访，否则骨架会排出"0km 转移日"，
         # 模型没法为它生成正常的一天，版式必乱
-        seq, merged_names = _collapse_near_stops(seq, located_names, dist_km)
+        seq, merged_names = _collapse_near_stops(
+            seq, located_names, dist_km, poi_ids=poi_ids,
+        )
         seq_names = [merged_names[i] for i in seq]
-        legs = [
-            {
+        legs = []
+        for a, b in zip(seq, seq[1:]):
+            override = rule_context["leg_overrides"].get((a, b), {})
+            leg = {
                 "from": merged_names[a],
                 "to": merged_names[b],
-                "km": dist_km[a][b],
-                "hours": dur_h[a][b],
-                "measured": measured[a][b],
+                "km": override.get("km", dist_km[a][b]),
+                "hours": override.get("hours", dur_h[a][b]),
+                "measured": override.get("measured", measured[a][b]),
+                "via": list(override.get("via") or []),
+                "corridor": override.get("corridor"),
+                "corridor_notice": override.get("notice"),
+                "no_merge": bool(override),
             }
-            for a, b in zip(seq, seq[1:])
-        ]
+            requirement = rule_context["visit_requirements"].get(b)
+            if requirement:
+                leg["visit_requirement"] = requirement
+                leg["no_merge"] = True
+            legs.append(leg)
 
         # 长途驾驶段标注沿途落脚点。超过 800km/10h 的段会在
         # build_day_plan 中强制拆成多个 Day，所以这里按实际驾车线路等距
@@ -404,7 +512,15 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
                     mid = ((ca[0] + cb[0]) / 2, (ca[1] + cb[1]) / 2)
                     leg["split_hint"] = await _regeo_city(client, key, mid)
 
-    markdown = _format_skeleton(seq_names, legs, failed, user_fixed_order, alerts)
+    markdown = _format_skeleton(
+        seq_names,
+        legs,
+        failed,
+        user_fixed_order,
+        alerts,
+        notes=rule_context["notes"],
+        blocking_issues=rule_context["blocking_issues"],
+    )
     if origin_inferred:
         markdown += (
             f"\n（用户未指定出发地，已按途经点推断默认从 {origin} 出发；"
@@ -419,6 +535,18 @@ async def _plan_geo(query: str, extracted: dict, notify=lambda msg: None) -> Opt
         "days_budget": days_budget,
         "origin_inferred": origin_inferred,
         "origin": origin,
+        "route_notes": rule_context["notes"],
+        "blocking_issues": rule_context["blocking_issues"],
+        "min_stay_days": {
+            merged_names[index]: days
+            for index, days in rule_context["min_stay_days"].items()
+            if index in merged_names
+        },
+        "visit_requirements": {
+            merged_names[index]: requirement
+            for index, requirement in rule_context["visit_requirements"].items()
+            if index in merged_names
+        },
         "markdown": markdown,
     }
 
@@ -499,23 +627,55 @@ async def _geocode_all(
     直接地理编码更稳。两种方式互为回退。poi_name 保留高德官方名称，
     其中可能带「(暂停开放)」等状态标注，供上层提取提醒。"""
 
-    async def poi_search(name: str) -> Optional[dict[str, Any]]:
+    async def query_pois(keyword: str) -> list[dict[str, Any]]:
         data = await _amap_paced(lambda: _request(client, key, "/place/text", {
-            "keywords": name,
-            "offset": 1,
+            "keywords": keyword,
+            "offset": 10,
             "page": 1,
+            "extensions": "all",
         }))
-        pois = (data or {}).get("pois") or []
-        if pois:
-            coord = _parse_location(pois[0].get("location") or "")
+        return list((data or {}).get("pois") or [])
+
+    async def poi_search(name: str) -> Optional[dict[str, Any]]:
+        # 先查完整名称；如果行政前缀把结果带偏（如“新源县巴音布鲁克”
+        # 命中那拉提酒店），再用景点核心名查询。候选按名称/类型评分，
+        # 不能再无条件采用第一条。
+        variants = [name]
+        core = _poi_core_name(name)
+        if core and core != name:
+            variants.append(core)
+        candidates: list[dict[str, Any]] = []
+        for variant in variants:
+            candidates.extend(await query_pois(variant))
+            if candidates and max(_poi_match_score(name, p) for p in candidates) >= 100:
+                break
+        ranked = sorted(candidates, key=lambda p: _poi_match_score(name, p), reverse=True)
+        for poi in ranked:
+            score = _poi_match_score(name, poi)
+            if score < 45:
+                break
+            coord = _parse_location(poi.get("location") or "")
             if coord:
-                return {"coord": coord, "poi_name": pois[0].get("name") or None}
+                return {
+                    "coord": coord,
+                    "poi_name": poi.get("name") or None,
+                    "poi_id": poi.get("id") or None,
+                    "poi_type": poi.get("type") or None,
+                    "city": poi.get("cityname") or None,
+                    "district": poi.get("adname") or None,
+                    "match_score": score,
+                }
         return None
 
     async def geocode(name: str) -> Optional[dict[str, Any]]:
         geo = await _amap_paced(lambda: _geocode(client, key, name))
         coord = _parse_location((geo or {}).get("location") or "")
-        return {"coord": coord, "poi_name": None} if coord else None
+        return {
+            "coord": coord,
+            "poi_name": None,
+            "poi_id": None,
+            "match_score": 0.0,
+        } if coord else None
 
     async def one(i: int, name: str) -> Optional[dict[str, Any]]:
         primary, fallback = (poi_search, geocode) if i >= poi_from_index else (geocode, poi_search)
@@ -624,6 +784,8 @@ async def _find_split_stop_names(
 
 
 def _route_cost(dist: list[list[float]], order: list[int], round_trip: bool) -> float:
+    if not order:
+        return 0.0
     cost = dist[0][order[0]]
     for a, b in zip(order, order[1:]):
         cost += dist[a][b]
@@ -647,15 +809,62 @@ def _canonical_direction(dist: list[list[float]], order: list[int], round_trip: 
     return order
 
 
-def _best_order(dist: list[list[float]], round_trip: bool) -> list[int]:
-    """求从 0 号点（出发地）出发遍历所有途经点的最短顺序。"""
-    idxs = list(range(1, len(dist)))
+def _apply_ordered_chains(
+    dist: list[list[float]],
+    order: list[int],
+    chains: list[list[int]],
+    round_trip: bool,
+) -> list[int]:
+    """把景观走廊锚点作为不可拆的有序块，选择代价最低的插入位置。"""
+    result = list(order)
+    for chain in chains:
+        present = [index for index in chain if index in result]
+        if len(present) != len(chain):
+            continue
+        remaining = [index for index in result if index not in chain]
+        candidates = [
+            remaining[:position] + list(chain) + remaining[position:]
+            for position in range(len(remaining) + 1)
+        ]
+        result = min(candidates, key=lambda item: _route_cost(dist, item, round_trip))
+    return result
+
+
+def _insert_gateway_excursions(
+    order: list[int], excursions: list[dict[str, Any]],
+) -> list[int]:
+    """把支线展开成 gateway→destination→gateway，允许门户节点重复。"""
+    result = list(order)
+    for excursion in excursions:
+        gateway = excursion["gateway"]
+        destination = excursion["destination"]
+        result = [index for index in result if index != destination]
+        if gateway not in result:
+            continue
+        position = result.index(gateway)
+        result[position + 1:position + 1] = [destination, gateway]
+    return result
+
+
+def _best_order(
+    dist: list[list[float]],
+    round_trip: bool,
+    indices: Optional[list[int]] = None,
+    ordered_chains: Optional[list[list[int]]] = None,
+) -> list[int]:
+    """求从 0 号点出发遍历指定途经点的较短顺序，再施加有序走廊。"""
+    idxs = list(indices) if indices is not None else list(range(1, len(dist)))
+    if not idxs:
+        return []
     if len(idxs) <= _BRUTE_FORCE_LIMIT:
         best = list(min(
             itertools.permutations(idxs),
             key=lambda p: _route_cost(dist, list(p), round_trip),
         ))
-        return _canonical_direction(dist, best, round_trip)
+        best = _canonical_direction(dist, best, round_trip)
+        return _apply_ordered_chains(
+            dist, best, ordered_chains or [], round_trip,
+        )
 
     # 贪心最近邻起步
     order, remaining, cur = [], set(idxs), 0
@@ -674,7 +883,8 @@ def _best_order(dist: list[list[float]], round_trip: bool) -> list[int]:
                 if _route_cost(dist, candidate, round_trip) < _route_cost(dist, order, round_trip):
                     order = candidate
                     improved = True
-    return _canonical_direction(dist, order, round_trip)
+    order = _canonical_direction(dist, order, round_trip)
+    return _apply_ordered_chains(dist, order, ordered_chains or [], round_trip)
 
 
 async def _driving_matrix(
@@ -743,8 +953,13 @@ def _format_skeleton(
     failed: list[str],
     user_fixed_order: bool,
     alerts: Optional[list[dict[str, str]]] = None,
+    notes: Optional[list[str]] = None,
+    blocking_issues: Optional[list[str]] = None,
 ) -> str:
-    source = "用户指定顺序" if user_fixed_order else "按高德实测距离计算的最短环线"
+    source = (
+        "用户指定顺序" if user_fixed_order
+        else "按地图距离、景观走廊与门户支线约束规划"
+    )
     lines = [f"### 路线骨架（{source}，顺序禁止更改）", ""]
     lines.append(" → ".join(seq_names))
     lines.append("")
@@ -753,9 +968,15 @@ def _format_skeleton(
     total_km = 0.0
     for i, leg in enumerate(legs, 1):
         total_km += leg["km"]
-        km_text = f"约 {leg['km']:.0f}km" + ("" if leg["measured"] else "（直线估算）")
+        if leg.get("corridor"):
+            estimate_label = "（季节性景观道路参考，出发前复核）"
+        else:
+            estimate_label = "" if leg["measured"] else "（直线估算）"
+        km_text = f"约 {leg['km']:.0f}km" + estimate_label
         hours_text = f"约 {leg['hours']:.1f}h" if leg["hours"] is not None else "—"
-        lines.append(f"| {i} | {leg['from']} → {leg['to']} | {km_text} | {hours_text} |")
+        via = list(leg.get("via") or [])
+        path = " → ".join([leg["from"], *via, leg["to"]])
+        lines.append(f"| {i} | {path} | {km_text} | {hours_text} |")
     lines.append("")
     lines.append(f"全程总里程：约 {total_km:,.0f}km")
     if failed:
@@ -781,6 +1002,10 @@ def _format_skeleton(
             f"⚠️ 高德当前标注「{alert['stop']}」状态为「{alert['status']}」，"
             f"攻略必须提醒出行前核实开放状态并给出附近备选"
         )
+    for note in notes or []:
+        lines.append(f"⚠️ {note}")
+    for issue in blocking_issues or []:
+        lines.append(f"⛔ {issue}")
     return "\n".join(lines)
 
 
@@ -817,6 +1042,9 @@ def _merge_legs_to_budget(legs: list[dict[str, Any]], budget: int) -> list[dict[
         for i in range(len(merged) - 1):
             # 安全拆分产生的边界是强制过夜点，不能为了凑用户天数又合并回去。
             if merged[i].get("long_leg_group") or merged[i + 1].get("long_leg_group"):
+                continue
+            # 景观走廊和必游景点的边界也不能被“凑天数”吞成普通途经点。
+            if merged[i].get("no_merge") or merged[i + 1].get("no_merge"):
                 continue
             km, hours = combined(merged[i], merged[i + 1])
             if km > _MERGE_MAX_KM or (hours or 0) > _MERGE_MAX_HOURS:
@@ -887,14 +1115,22 @@ def _expand_unsafe_legs(legs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return expanded
 
 
-def _fit_stays_to_budget(stay_days: list[int], stays_total: int) -> list[int]:
-    """把停留天数调整到恰好 stays_total：超了从后往前削，缺了轮流补。"""
-    result = list(stay_days)
+def _fit_stays_to_budget(
+    stay_days: list[int],
+    stays_total: int,
+    minimums: Optional[list[int]] = None,
+) -> list[int]:
+    """在不突破必游景点最低停留日的前提下，调整到 stays_total。"""
+    floors = list(minimums or [0] * len(stay_days))
+    floors += [0] * max(0, len(stay_days) - len(floors))
+    result = [max(value, floors[i]) for i, value in enumerate(stay_days)]
     while sum(result) > stays_total:
         for i in range(len(result) - 1, -1, -1):
-            if result[i] > 0:
+            if result[i] > floors[i]:
                 result[i] -= 1
                 break
+        else:
+            break
     guard = 0
     while sum(result) < stays_total and guard < stays_total * 2:
         for i in range(len(result)):
@@ -952,6 +1188,11 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
         return persistent
     if not legs:
         return None
+    if route.get("blocking_issues"):
+        return {
+            "infeasible": True,
+            "reason": "；".join(route["blocking_issues"]),
+        }
     days_budget = route.get("days_budget")
 
     # 标记返程段，先把超限长段强制拆成多个安全驾驶日，再按用户天数预算
@@ -970,12 +1211,15 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
     if days_budget and days_budget < len(legs):
         legs = _merge_legs_to_budget(legs, days_budget)
         if len(legs) > days_budget:
-            # 安全驾驶上限内压不进用户天数：按最少可行天数排，并要求攻略说明
-            budget_note = (
-                f"用户要求 {days_budget} 天，但在单日驾驶安全上限内本路线最少需要 "
-                f"{len(legs)} 天。骨架已按最少可行天数排布，你必须在「重要提示」中"
-                f"说明该冲突并建议增加天数，禁止为凑天数压缩或删减途经点。"
-            )
+            return {
+                "infeasible": True,
+                "reason": (
+                    f"用户要求 {days_budget} 天，但在单日驾驶安全上限内这组目的地"
+                    f"至少需要 {len(legs)} 个转移日；请减少跨区景点、增加天数，"
+                    "或改为异地还车，程序不会锁定一条无法执行的骨架"
+                ),
+                "minimum_days": len(legs),
+            }
 
     # 只给用户真正要游玩的目的地分配深度游天数；安全拆分产生的沿途
     # 过夜城市只住一晚，不能被模型再加 1-3 个“深度游”日。
@@ -986,17 +1230,33 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
     if not stay_leg_indexes:
         return None
     stop_names = [legs[i]["to"] for i in stay_leg_indexes]
+    required_stays = route.get("min_stay_days") or {}
+    minimum_stays = [int(required_stays.get(name, 0) or 0) for name in stop_names]
 
     if days_budget:
         stays_total = max(0, min(days_budget, _MAX_TOTAL_DAYS) - len(legs))
+        if sum(minimum_stays) > stays_total:
+            minimum_days = len(legs) + sum(minimum_stays)
+            return {
+                "infeasible": True,
+                "reason": (
+                    f"用户要求 {days_budget} 天，但保留必游景点的实际游览时间后"
+                    f"至少需要 {minimum_days} 天；请减少远距离推荐点、增加天数，"
+                    "或改为异地还车，程序不会把必游景点降级成路过远眺"
+                ),
+                "minimum_days": minimum_days,
+            }
         if stays_total > 0:
             stay_days = _fit_stays_to_budget(
-                await _allocate_stay_days(query, stop_names, llm), stays_total,
+                await _allocate_stay_days(query, stop_names, llm),
+                stays_total,
+                minimums=minimum_stays,
             )
         else:
             stay_days = [0] * len(stop_names)
     else:
         stay_days = await _allocate_stay_days(query, stop_names, llm)
+        stay_days = [max(value, minimum_stays[i]) for i, value in enumerate(stay_days)]
 
     stays_by_leg = dict(zip(stay_leg_indexes, stay_days))
     days, d = [], 1
@@ -1013,6 +1273,9 @@ async def build_day_plan(query: str, route: dict, llm) -> Optional[dict]:
             "journey_day": leg.get("journey_day"),
             "journey_days": leg.get("journey_days"),
             "final_destination": leg.get("final_destination"),
+            "corridor": leg.get("corridor"),
+            "corridor_notice": leg.get("corridor_notice"),
+            "visit_requirement": leg.get("visit_requirement"),
         })
         d += 1
         if i in stays_by_leg:
@@ -1290,6 +1553,13 @@ def _render_scaffold(
                     f"　↳ 本日为串点日：途中依次游览 {'、'.join(day['via'])}，"
                     f"再抵达 {day['to']} 过夜；时段表须覆盖每个途经点的游览安排"
                 )
+            if day.get("corridor"):
+                lines.append(
+                    f"　↳ 本日计划按「{day['corridor']}」景观走廊行驶；"
+                    f"{day.get('corridor_notice') or '出发前复核实时通行状态'}"
+                )
+            if day.get("visit_requirement"):
+                lines.append(f"　↳ 必游硬约束：{day['visit_requirement']}")
             if day.get("long_leg_group"):
                 progress = f"第 {day['journey_day']}/{day['journey_days']} 天"
                 if day.get("is_safety_stop"):

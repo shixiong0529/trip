@@ -486,6 +486,8 @@ class TravelGuideOrchestrator:
                             dp = await build_day_plan(query, r, self.fast_llm)
                         except Exception:
                             logger.exception("日程脚手架生成异常，退化为仅注入路线骨架")
+                        if isinstance(dp, dict) and dp.get("infeasible"):
+                            return r, "infeasible", dp
                     return r, s, dp
                 finally:
                     logger.info("stage=route_plan elapsed=%.2fs", time.monotonic() - stage_started)
@@ -533,14 +535,23 @@ class TravelGuideOrchestrator:
             except Exception:
                 logger.exception("路线规划任务异常")
 
+            if plan_status == "infeasible":
+                reason = (
+                    day_plan.get("reason")
+                    if isinstance(day_plan, dict)
+                    else "路线在给定天数内无法安全执行"
+                )
+                yield {"type": "error", "data": f"路线可行性检查未通过：{reason}"}
+                return
+
             if route:
                 travel_data["route_plan"] = route["markdown"]
                 if day_plan:
                     travel_data["route_overview"] = day_plan["overview"]
                     travel_data["day_scaffold"] = day_plan["scaffold_md"]
-                    yield {"type": "progress", "data": "多点路线已按地图实测距离排定，并锁定每日行程骨架..."}
+                    yield {"type": "progress", "data": "多点路线已按地图距离、景观道路与门户约束排定，并锁定每日行程骨架..."}
                 else:
-                    yield {"type": "progress", "data": "多点路线已按地图实测距离排定最短环线..."}
+                    yield {"type": "progress", "data": "多点路线已按地图距离与路线语义约束排定..."}
             elif plan_status == "failed":
                 # 规划失败对路线质量影响很大，必须让用户可见，而不是静默降级
                 yield {"type": "progress", "data": "⚠️ 多点路线规划未生效，本次路线顺序由 AI 自行推算，建议重新生成一次..."}

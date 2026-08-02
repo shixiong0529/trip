@@ -3,9 +3,15 @@
 import asyncio
 
 from services.route_planner import (
+    _apply_ordered_chains,
+    _collapse_near_stops,
     _expand_unsafe_legs,
+    _insert_gateway_excursions,
     _match_day,
     _normalize_query_for_cache,
+    _poi_core_name,
+    _poi_match_score,
+    _plan_geo,
     _required_drive_days,
     _sample_path,
     _dayplan_cache,
@@ -14,6 +20,7 @@ from services.route_planner import (
     repair_day_headings,
     validate_day_sequence,
 )
+from services.route_rules import canonicalize_corridor_stops, resolve_route_rules
 
 
 def test_unsafe_4000km_leg_requires_multiple_real_days():
@@ -299,3 +306,167 @@ def test_route_planner_skips_outbound_before_calling_llm(monkeypatch):
 
     assert route is None
     assert status == "not_applicable"
+
+
+def test_poi_candidate_scoring_rejects_wrong_business_and_tianchi_road():
+    wrong_bayan = {"name": "携程度假农庄(那拉提河谷草原店)"}
+    right_bayan = {"name": "巴音布鲁克大草原"}
+    wrong_tianchi = {"name": "天池路"}
+    right_tianchi = {"name": "天山天池风景区"}
+
+    assert _poi_core_name("新源县巴音布鲁克草原") == "巴音布鲁克草原"
+    assert _poi_match_score("新源县巴音布鲁克草原", right_bayan) > _poi_match_score(
+        "新源县巴音布鲁克草原", wrong_bayan
+    )
+    assert _poi_match_score("乌鲁木齐市天山天池", right_tianchi) > _poi_match_score(
+        "乌鲁木齐市天山天池", wrong_tianchi
+    )
+
+
+def test_distinct_nearby_pois_are_not_collapsed_by_distance_alone():
+    names = ["乌鲁木齐", "新源县那拉提旅游风景区", "和静县巴音布鲁克草原"]
+    distance = [
+        [0, 400, 410],
+        [400, 0, 8],
+        [410, 8, 0],
+    ]
+
+    seq, merged = _collapse_near_stops(
+        [0, 1, 2, 0], names, distance, poi_ids=[None, "nalati", "bayan"]
+    )
+
+    assert seq == [0, 1, 2, 0]
+    assert merged[1] != merged[2]
+
+
+def test_duku_corridor_is_an_ordered_block_and_tashkurgan_uses_kashgar_gateway():
+    names = [
+        "乌鲁木齐", "库车市天山神秘大峡谷", "喀什市喀什古城",
+        "和静县巴音布鲁克草原", "塔什库尔干县帕米尔旅游区",
+        "新源县那拉提旅游风景区", "赛里木湖",
+    ]
+    context = resolve_route_rules(
+        "8月新疆自然景观自驾14天", names,
+    )
+    # 故意给一条错误顺序，通用约束器须先修成连续走廊。
+    distance = [[0 if i == j else 100 for j in range(len(names))] for i in range(len(names))]
+    order = _apply_ordered_chains(
+        distance,
+        [6, 1, 2, 3, 5],
+        context["ordered_chains"],
+        True,
+    )
+    order = _insert_gateway_excursions(order, context["gateway_excursions"])
+
+    nalati, bayan, kuqa = 5, 3, 1
+    start = order.index(nalati)
+    assert order[start:start + 3] == [nalati, bayan, kuqa]
+    kashgar = order.index(2)
+    assert order[kashgar:kashgar + 3] == [2, 4, 2]
+    assert context["leg_overrides"][(bayan, kuqa)]["corridor"] == "G217独库公路南段"
+
+
+def test_corridor_stop_canonicalization_fixes_wrong_admin_prefixes():
+    stops = canonicalize_corridor_stops(
+        "新疆自驾14天",
+        ["伊宁市那拉提草原", "新源县巴音布鲁克草原", "库车大峡谷"],
+    )
+
+    assert stops == [
+        "新源县那拉提旅游风景区",
+        "和静县巴音布鲁克草原",
+        "库车市天山神秘大峡谷",
+    ]
+
+
+def _bayan_required_route(days_budget):
+    requirement = "必须进入巴音布鲁克景区，禁止只路过、远眺或只作短暂休息"
+    return {
+        "seq_names": ["乌鲁木齐", "新源县那拉提旅游风景区", "和静县巴音布鲁克草原", "乌鲁木齐"],
+        "legs": [
+            {"from": "乌鲁木齐", "to": "新源县那拉提旅游风景区", "km": 450, "hours": 6, "measured": True},
+            {
+                "from": "新源县那拉提旅游风景区", "to": "和静县巴音布鲁克草原",
+                "km": 225, "hours": 5.5, "measured": True,
+                "visit_requirement": requirement, "no_merge": True,
+            },
+            {"from": "和静县巴音布鲁克草原", "to": "乌鲁木齐", "km": 500, "hours": 7, "measured": True},
+        ],
+        "round_trip": True,
+        "days_budget": days_budget,
+        "min_stay_days": {"和静县巴音布鲁克草原": 1},
+        "markdown": f"bayan-required-{days_budget}",
+    }
+
+
+def test_bayanbulak_minimum_stay_cannot_be_reduced_to_pass_through(isolated_db):
+    plan = asyncio.run(build_day_plan("新疆自驾5天", _bayan_required_route(5), object()))
+
+    assert plan is not None and not plan.get("infeasible")
+    assert any(
+        day.get("kind") == "stay" and day.get("at") == "和静县巴音布鲁克草原"
+        for day in plan["days"]
+    )
+    assert "禁止只路过、远眺" in plan["scaffold_md"]
+
+
+def test_required_visit_over_day_budget_is_rejected_instead_of_dropped(isolated_db):
+    plan = asyncio.run(build_day_plan("新疆自驾3天", _bayan_required_route(3), object()))
+
+    assert plan["infeasible"] is True
+    assert "不会把必游景点降级成路过远眺" in plan["reason"]
+
+
+def test_geo_pipeline_applies_corridor_gateway_and_visit_metadata(monkeypatch):
+    from services import route_planner
+
+    async def fake_geocode(client, key, names):
+        return [
+            {
+                "coord": (float(index), float(index)),
+                "poi_name": name,
+                "poi_id": f"poi-{index}",
+            }
+            for index, name in enumerate(names)
+        ]
+
+    async def fake_matrix(client, key, coords):
+        n = len(coords)
+        distance = [[0.0 if i == j else 100.0 for j in range(n)] for i in range(n)]
+        duration = [[0.0 if i == j else 2.0 for j in range(n)] for i in range(n)]
+        measured = [[True for _ in range(n)] for _ in range(n)]
+        # 模拟高德当前时段把巴音→库车算成绕行；规则仍须用景观走廊参考覆盖。
+        distance[2][3], duration[2][3] = 751.0, 10.1
+        return distance, duration, measured
+
+    monkeypatch.setenv("AMAP_WEB_SERVICE_KEY", "test-key")
+    monkeypatch.setattr(route_planner, "_geocode_all", fake_geocode)
+    monkeypatch.setattr(route_planner, "_driving_matrix", fake_matrix)
+    route = asyncio.run(_plan_geo(
+        "8月新疆自然景观自驾14天",
+        {
+            "origin": "乌鲁木齐",
+            "stops": [
+                "新源县那拉提草原", "和静县巴音布鲁克草原", "库车大峡谷",
+                "喀什古城", "塔什库尔干帕米尔旅游区",
+            ],
+            "round_trip": True,
+            "days": 14,
+        },
+    ))
+
+    sequence = route["seq_names"]
+    nalati = sequence.index("新源县那拉提旅游风景区")
+    assert sequence[nalati:nalati + 3] == [
+        "新源县那拉提旅游风景区",
+        "和静县巴音布鲁克草原",
+        "库车市天山神秘大峡谷",
+    ]
+    kashgar = sequence.index("喀什古城")
+    assert sequence[kashgar:kashgar + 3] == [
+        "喀什古城", "塔什库尔干帕米尔旅游区", "喀什古城",
+    ]
+    corridor = next(leg for leg in route["legs"] if leg.get("corridor"))
+    assert corridor["km"] == 280.0
+    assert corridor["via"] == ["G217独库公路南段", "库车大小龙池"]
+    assert route["min_stay_days"]["和静县巴音布鲁克草原"] == 1

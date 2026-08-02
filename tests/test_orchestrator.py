@@ -355,6 +355,40 @@ def test_locked_day_plan_never_regenerates_entire_report(monkeypatch):
     assert events[-1] == {"type": "progress", "data": "正在生成精美文档..."}
 
 
+def test_infeasible_route_is_stopped_before_report_generation(monkeypatch):
+    class ReportMustNotRun:
+        async def chat_stream(self, messages):
+            raise AssertionError("不可行路线不能进入正文模型")
+            yield
+
+    async def fake_collect(*args, **kwargs):
+        return {}
+
+    async def fake_plan(*args, **kwargs):
+        return {"markdown": "unsafe route"}, "ok"
+
+    async def fake_build(*args, **kwargs):
+        return {
+            "infeasible": True,
+            "reason": "14天无法容纳门户往返与必游停留",
+        }
+
+    monkeypatch.setattr("services.data_collector.collect_travel_data", fake_collect)
+    monkeypatch.setattr("services.route_planner.plan_route", fake_plan)
+    monkeypatch.setattr("services.route_planner.build_day_plan", fake_build)
+
+    orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m")
+    orchestrator.llm = ReportMustNotRun()
+
+    async def consume():
+        return [event async for event in orchestrator.generate("新疆自驾14天")]
+
+    events = asyncio.run(consume())
+
+    assert events[-1]["type"] == "error"
+    assert "路线可行性检查未通过" in events[-1]["data"]
+
+
 def test_empty_report_stream_retries_once_without_recollecting_data():
     class EmptyThenSuccessLLM:
         last_finish_reason = None
