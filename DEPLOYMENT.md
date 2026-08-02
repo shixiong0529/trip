@@ -9,7 +9,16 @@
 ```ini
 HOST=0.0.0.0
 PORT=8081
+
+# 专业版发布前自动审核、诊断并修复主要问题
+PRO_REVIEW_MODE=repair
+PRO_REVIEW_TIMEOUT=60
+PRO_REVIEW_MAX_TOKENS=2500
+PRO_REVIEW_TOTAL_TIMEOUT=420
+PRO_REWRITE_MAX_ATTEMPTS=1
 ```
+
+`PRO_REVIEW_MODE` 支持 `off`、`shadow`、`audit`、`repair`。生产默认使用 `repair`；如需紧急回退，可改为 `off` 后重启服务。`shadow` 会完成诊断并记录指标，但仍发布初稿；`audit` 对需要重写或重规划的主要/严重问题拦截发布，不执行模型重写。实时开放、票价等只能人工核实的问题不会交给模型猜测。
 
 创建服务：
 
@@ -66,8 +75,9 @@ server {
         proxy_set_header X-Forwarded-Proto $scheme;
 
         proxy_buffering off;
-        proxy_read_timeout 300s;
-        proxy_send_timeout 300s;
+        # 专业版包含初稿、审核和最多一次修复，需覆盖 420 秒业务总时限。
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
     }
 }
 ```
@@ -79,6 +89,15 @@ ln -sf /etc/nginx/sites-available/trip /etc/nginx/sites-enabled/trip
 nginx -t
 systemctl reload nginx
 ```
+
+专业版审核期间仍通过 SSE 返回进度。反向代理必须关闭缓冲，并将读写超时保持在 `PRO_REVIEW_TOTAL_TIMEOUT` 之上；默认建议 600 秒。修改 `.env` 后执行：
+
+```bash
+systemctl restart trip
+journalctl -u trip -n 100 --no-pager
+```
+
+日志应能看到专业版的审核结论及是否触发修复。标准版不会进入该流程。若新模型的诊断 JSON 不稳定，可临时切换为 `PRO_REVIEW_MODE=shadow` 收集结果，或切换为 `off` 完全关闭审核。
 
 ## HTTPS 证书
 

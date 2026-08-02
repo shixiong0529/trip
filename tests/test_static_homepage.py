@@ -95,6 +95,16 @@ def test_homepage_defaults_to_standard_mode_and_exposes_accessible_switch():
     assert index.index('id="char-count"') < index.index('id="btn-generate"')
 
 
+def test_professional_mode_explains_hidden_review_and_repair():
+    app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
+
+    assert "完整生成，并自动审核修复路线与行程问题" in app_js
+    assert "专业版将自动审核并修复路线与行程问题" in app_js
+    assert "专业版初稿不会立即发布" not in app_js
+    assert "data.professional_review.mode" in app_js
+    assert "state.proReviewMode" in app_js
+
+
 def test_generation_tab_switch_preserves_the_real_generation_mode():
     app_js = (ROOT / "static" / "app.js").read_text(encoding="utf-8")
 

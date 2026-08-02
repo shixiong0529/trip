@@ -302,8 +302,8 @@ def test_chat_stream_disables_thinking_mode(monkeypatch):
     assert captured[0]["thinking"] == {"type": "disabled"}
 
 
-def test_locked_day_plan_never_regenerates_entire_report(monkeypatch):
-    """结构校验失败也必须继续做 HTML，不能再次调用主模型生成整篇报告。"""
+def test_standard_locked_day_plan_never_regenerates_entire_report(monkeypatch):
+    """标准版仍保持单次正文生成，不进入专业版审核重写流程。"""
     calls = 0
 
     class FakeReportLLM:
@@ -339,7 +339,9 @@ def test_locked_day_plan_never_regenerates_entire_report(monkeypatch):
     monkeypatch.setattr("services.route_planner.plan_route", fake_plan)
     monkeypatch.setattr("services.route_planner.build_day_plan", fake_build)
 
-    orchestrator = TravelGuideOrchestrator("https://api.example.com/v1", "k", "m")
+    orchestrator = TravelGuideOrchestrator(
+        "https://api.example.com/v1", "k", "m", mode="standard"
+    )
     orchestrator.llm = FakeReportLLM()
 
     async def consume():

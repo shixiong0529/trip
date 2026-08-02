@@ -53,6 +53,7 @@
     activeTab: 'generate', // generate | trips；切换页面时保留真实生成状态
     pdfReady: true,      // 由 /api/health 的 pdf_ready 更新，决定 PDF 下载按钮是否可用
     generationMode: 'standard', // standard | professional；刷新后始终默认标准版
+    proReviewMode: 'repair', // 由 /api/health 返回，确保专业版等待文案符合后端实际模式
   };
 
   // 旧版本曾把 API Key 保存在浏览器中；现在统一使用服务端配置并清理遗留敏感数据。
@@ -70,6 +71,9 @@
       const hasServerKey = data.llm_configured;
 
       state.pdfReady = data.pdf_ready !== false;
+      if (data.professional_review && typeof data.professional_review.mode === 'string') {
+        state.proReviewMode = data.professional_review.mode;
+      }
       updatePdfButtonState();
 
       if (els.statusDot && els.statusText) {
@@ -142,7 +146,7 @@
     });
     if (els.modeDescription) {
       els.modeDescription.textContent = professional
-        ? '信息最完整，保留全部详细板块，生成时间较长'
+        ? '完整生成，并自动审核修复路线与行程问题'
         : '更快生成，保留核心行程、预算和避坑信息';
     }
   }
@@ -221,8 +225,14 @@
     state.abortController = controller;
 
     if (els.generatingNote) {
+      const professionalNotes = {
+        off: '专业版将直接生成完整报告',
+        shadow: '专业版初稿完成后进行影子审核，本次不自动改写',
+        audit: '专业版初稿完成后先审核，存在主要问题时停止发布',
+        repair: '专业版将自动审核并修复路线与行程问题',
+      };
       els.generatingNote.textContent = state.generationMode === 'professional'
-        ? '专业版内容更完整，生成时间较长'
+        ? (professionalNotes[state.proReviewMode] || professionalNotes.repair)
         : '标准版通常可更快生成';
     }
     const body = { query: query, mode: state.generationMode };

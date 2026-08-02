@@ -135,6 +135,14 @@ async def health_check():
             "active": _generation_gate.active,
             "waiting": _generation_gate.waiting,
         },
+        "professional_review": {
+            # 仅暴露非敏感运行状态，方便前端文案和部署后核验；不返回
+            # API 地址、密钥或完整提示词。
+            "mode": app_config.pro_review_mode,
+            "timeout_seconds": app_config.pro_review_timeout,
+            "total_timeout_seconds": app_config.pro_review_total_timeout,
+            "max_rewrite_attempts": app_config.pro_rewrite_max_attempts,
+        },
     }
 
 
@@ -201,6 +209,11 @@ async def generate_guide(request: Request):
                         else:
                             lines = f"data: {data}"
                         yield f"event: content\n{lines}\n\n"
+                    elif event["type"] == "final_content":
+                        # 专业版的第一稿、诊断和修复过程全部留在服务端；只有
+                        # 通过最终校验的正文进入持久化流程，不把隐藏草稿通过
+                        # SSE 暴露给浏览器。
+                        full_markdown = event["data"]
                     elif event["type"] == "progress":
                         yield f"event: progress\ndata: {_sse_line(event['data'])}\n\n"
                     elif event["type"] == "reset":

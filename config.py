@@ -70,6 +70,27 @@ class AppConfig:
             1, int(os.getenv("EXPORT_MAX_CONCURRENCY", "1"))
         )
 
+        # 专业版报告在发布前使用主模型进行独立审核，并在发现主要问题时
+        # 最多自动修复一次。标准版不进入该流程，因而不会增加标准版耗时。
+        review_mode = os.getenv("PRO_REVIEW_MODE", "repair").strip().lower()
+        if review_mode not in {"off", "shadow", "audit", "repair"}:
+            review_mode = "repair"
+        self.pro_review_mode = review_mode
+        self.pro_review_timeout = max(
+            10.0, float(os.getenv("PRO_REVIEW_TIMEOUT", "60"))
+        )
+        self.pro_review_max_tokens = max(
+            256, int(os.getenv("PRO_REVIEW_MAX_TOKENS", "2500"))
+        )
+        self.pro_review_total_timeout = max(
+            self.pro_review_timeout,
+            float(os.getenv("PRO_REVIEW_TOTAL_TIMEOUT", "420")),
+        )
+        # 当前修复流程只允许重写一次，避免模型在审核与重写之间形成循环。
+        self.pro_rewrite_max_attempts = min(
+            1, max(0, int(os.getenv("PRO_REWRITE_MAX_ATTEMPTS", "1")))
+        )
+
         # CORS 允许的来源，逗号分隔；未配置时默认仅允许本机同端口访问（本地前端为同源，不受 CORS 影响）
         origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
         if origins_env:

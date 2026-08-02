@@ -130,7 +130,8 @@ def test_generation_request_passes_professional_mode(monkeypatch, isolated_db):
             modes.append(kwargs["mode"])
 
         async def generate(self, query: str):
-            yield {"type": "content", "data": "# 专业版测试"}
+            yield {"type": "progress", "data": "正在审核隐藏初稿"}
+            yield {"type": "final_content", "data": "# 专业版最终报告"}
 
     monkeypatch.setattr("orchestrator.TravelGuideOrchestrator", FakeOrchestrator)
     monkeypatch.setattr(
@@ -142,8 +143,11 @@ def test_generation_request_passes_professional_mode(monkeypatch, isolated_db):
 
     guide_id = _result_id(stream)
     assert modes == ["professional"]
+    assert "event: content" not in stream
+    assert "正在审核隐藏初稿" in stream
     guide = isolated_db.get_guide(guide_id)
     assert guide is not None
+    assert guide["markdown"].startswith("# 专业版最终报告")
     assert re.search(r"本报告生成耗时\d+分\d+秒", guide["markdown"])
     assert "本报告生成耗时" in guide["html"]
 

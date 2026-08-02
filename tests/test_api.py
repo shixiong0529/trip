@@ -36,6 +36,8 @@ def test_health_check():
     assert "llm_configured" in data
     assert "fast_model" in data
     assert "pdf_ready" in data
+    assert data["professional_review"]["mode"] in {"off", "shadow", "audit", "repair"}
+    assert data["professional_review"]["max_rewrite_attempts"] in {0, 1}
 
 
 # ---------- 生成攻略 ----------
