@@ -206,9 +206,9 @@ body {
 .generation-mode-selector {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-start;
   gap: 16px;
-  padding: 12px 0;
+  padding: 12px 0 0;
   border-top: 1px solid rgba(16, 24, 40, 0.07);
 }
 .mode-choice-row {
@@ -258,20 +258,24 @@ body {
 }
 .mode-switch.professional .mode-switch-knob { transform: translateX(22px); }
 .mode-description {
-  margin: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0 0 0 auto;
   color: var(--ink-3);
   font-size: 0.78em;
   line-height: 1.4;
   text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
-.input-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding-top: 10px;
-  border-top: 1px solid rgba(16, 24, 40, 0.07);
+.char-count {
+  flex: 0 0 auto;
+  font-size: 0.8em;
+  color: var(--ink-3);
+  white-space: nowrap;
 }
-.char-count { font-size: 0.8em; color: var(--ink-3); }
+.generation-mode-selector > .btn-primary { flex: 0 0 auto; }
 
 /* ---------- 按钮体系:药丸 ---------- */
 .btn {
@@ -799,14 +803,15 @@ body {
   }
   .mode-choice-row { width: 100%; justify-content: center; }
   .mode-option { min-height: 36px; padding: 7px 5px; }
-  .mode-description { width: 100%; text-align: center; }
+  .mode-description {
+    width: 100%;
+    margin-left: 0;
+    text-align: center;
+    white-space: normal;
+    overflow: visible;
+  }
 
   /* 生成按钮改为整行大按钮，字数统计移到上方，单手更好点 */
-  .input-footer {
-    flex-direction: column;
-    align-items: stretch;
-    gap: 12px;
-  }
   .char-count { align-self: flex-start; }
   .input-box .btn-primary {
     width: 100%;

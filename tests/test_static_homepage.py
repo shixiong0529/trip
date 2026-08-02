@@ -89,6 +89,10 @@ def test_homepage_defaults_to_standard_mode_and_exposes_accessible_switch():
     assert "setGenerationMode('standard')" in app_js
     assert ".mode-switch.professional" in css
     assert ".mode-switch-knob" in css
+    assert '<div class="input-footer">' not in index
+    assert ".generation-mode-selector > .btn-primary" in css
+    assert index.index('id="mode-description"') < index.index('id="char-count"')
+    assert index.index('id="char-count"') < index.index('id="btn-generate"')
 
 
 def test_generation_tab_switch_preserves_the_real_generation_mode():
